@@ -7,6 +7,8 @@ Git worktree helpers with first-class tmux integration for coding agents.
 - Optional: GitHub CLI (`gh`) for `gwt from-pr`
 - Optional: any executable you want to start in the "agent" pane
 
+Optimal usage expects basic tmux familiarity—know how to detach, switch panes, enter copy mode, and toggle pane full screen: `Ctrl+b d`, `Ctrl+b o`, `Ctrl+b [`, and `Ctrl+b z` respectively.
+
 ## Install
 ```bash
 git clone <repo-url>
@@ -75,3 +77,6 @@ Generate completion scripts from the CLI:
 - Zsh: `eval "$(gwt completion zsh)"`
 
 If you use `share/gwt-profile.sh` it will register the appropriate completion automatically.
+
+## Tips
+- Alias frequently used agent arguments (for continuing conversations, granting permissions, etc.) so you can pass them to `gwt` without retyping the full command each time (e.g., `alias ccdsp="claude --dangerously-skip-permissions"`).
