@@ -40,6 +40,7 @@ Usage: gwt <command> [args]
 
 Core commands
   new <branch> [base]     Create a worktree + tmux session (base defaults to main)
+                          Use --agent CMD or --no-agent to override the agent pane
   switch <branch>         Attach to an existing session
   list                    List worktrees and matching tmux sessions
   remove <branch>         Remove worktree and tmux session
@@ -154,6 +155,8 @@ create_worktree() {
 
 configure_tmux_session() {
     local branch="$1"
+    local agent_override="${2:-}"
+    local agent_override_set="${3:-0}"
     local worktree_dir
     worktree_dir="$(worktree_path_for_branch "$branch")"
     local session
@@ -174,8 +177,15 @@ configure_tmux_session() {
     tmux rename-window -t "$session:0" "workspace"
     tmux split-window -t "$session:0" -h -c "$worktree_dir"
 
-    if [[ -n "${GWT_AGENT_COMMAND:-}" ]]; then
-        tmux send-keys -t "$session:0.0" "$GWT_AGENT_COMMAND" C-m
+    local agent_command=""
+    if [[ "$agent_override_set" -eq 1 ]]; then
+        agent_command="$agent_override"
+    else
+        agent_command="${GWT_AGENT_COMMAND:-}"
+    fi
+
+    if [[ -n "$agent_command" ]]; then
+        tmux send-keys -t "$session:0.0" "$agent_command" C-m
     fi
     tmux send-keys -t "$session:0.1" "git status" C-m
 
@@ -185,14 +195,63 @@ configure_tmux_session() {
 cmd_new() {
     require_git_repo
     require_command tmux
-    local branch="${1:-}"
-    local base_branch="${2:-${GWT_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}}"
-    if [[ -z "$branch" ]]; then
-        echo "Usage: gwt new <branch> [base]" >&2
+    local branch=""
+    local base_branch=""
+    local agent_override=""
+    local agent_override_set=0
+    local positionals=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --agent)
+                if [[ $# -lt 2 ]]; then
+                    echo "gwt new: --agent requires a command" >&2
+                    exit 1
+                fi
+                agent_override="$2"
+                agent_override_set=1
+                shift 2
+                ;;
+            --agent=*)
+                agent_override="${1#*=}"
+                agent_override_set=1
+                shift
+                ;;
+            --no-agent)
+                agent_override=""
+                agent_override_set=1
+                shift
+                ;;
+            --)
+                shift
+                positionals+=("$@")
+                break
+                ;;
+            --*)
+                echo "gwt new: unknown option '$1'" >&2
+                exit 1
+                ;;
+            *)
+                positionals+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#positionals[@]} -lt 1 ]]; then
+        echo "Usage: gwt new <branch> [base] [--agent CMD | --no-agent]" >&2
         exit 1
     fi
+
+    branch="${positionals[0]}"
+    if [[ ${#positionals[@]} -ge 2 ]]; then
+        base_branch="${positionals[1]}"
+    else
+        base_branch="${GWT_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}"
+    fi
+
     create_worktree "$branch" "$base_branch"
-    configure_tmux_session "$branch"
+    configure_tmux_session "$branch" "$agent_override" "$agent_override_set"
 }
 
 cmd_switch() {
@@ -463,6 +522,14 @@ _gwt_completion() {
             COMPREPLY=( $(compgen -W "$options" -- "$cur") )
             ;;
         new)
+            local prev="${COMP_WORDS[COMP_CWORD-1]}"
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--agent --no-agent" -- "$cur") )
+                return
+            fi
+            if [[ "$prev" == "--agent" ]]; then
+                return
+            fi
             if (( COMP_CWORD == 2 || COMP_CWORD == 3 )); then
                 local options
                 options=$(_gwt_branch_locals)
@@ -536,6 +603,20 @@ _gwt() {
             _describe 'branch' bases
             ;;
         new)
+            local current_arg=${words[CURRENT]}
+            local prev_arg=${words[CURRENT-1]}
+            if [[ $current_arg == -* ]]; then
+                local -a new_opts
+                new_opts=(
+                    '--agent:Set command to run in agent pane'
+                    '--no-agent:Do not start an agent pane'
+                )
+                _describe 'option' new_opts
+                return
+            fi
+            if [[ $prev_arg == --agent ]]; then
+                return
+            fi
             if (( CURRENT == 3 || CURRENT == 4 )); then
                 local -a locals
                 locals=(${(f)"$(_gwt_branch_locals)"})
