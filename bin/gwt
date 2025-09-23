@@ -186,6 +186,7 @@ configure_tmux_session() {
 
     if [[ -n "$agent_command" ]]; then
         tmux send-keys -t "$session:0.0" "$agent_command" C-m
+        tmux select-pane -t "$session:0.0"
     fi
     tmux send-keys -t "$session:0.1" "git status" C-m
 
