@@ -27,8 +27,11 @@ set_config_value() {
     touch "$CONFIG_FILE"
     local escaped
     escaped=$(printf '%q' "$value")
+    local escaped_sed
+    escaped_sed="${escaped//\\/\\\\}"
+    escaped_sed="${escaped_sed//&/\\&}"
     if grep -q "^${key}=" "$CONFIG_FILE"; then
-        sed -i "s|^${key}=.*$|${key}=${escaped}|" "$CONFIG_FILE"
+        sed -i "s|^${key}=.*$|${key}=${escaped_sed}|" "$CONFIG_FILE"
     else
         printf '%s=%s\n' "$key" "$escaped" >> "$CONFIG_FILE"
     fi
