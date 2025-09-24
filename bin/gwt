@@ -125,6 +125,83 @@ copy_env_if_present() {
     fi
 }
 
+find_workspace_file() {
+    local root
+    root="$(repo_root)"
+    find "$root" -maxdepth 1 -type f -name '*.code-workspace' -print -quit
+}
+
+update_workspace_for_branch() {
+    local action="$1"
+    local branch="$2"
+    local workspace_file
+    workspace_file="$(find_workspace_file)"
+    if [[ -z "$workspace_file" ]]; then
+        return
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "gwt: python3 required to update workspace file" >&2
+        return
+    fi
+    local worktree_dir
+    worktree_dir="$(worktree_path_for_branch "$branch")"
+    python3 - "$workspace_file" "$worktree_dir" "$action" <<'PY'
+import json
+import os
+import sys
+
+workspace_file, worktree_dir, action = sys.argv[1:4]
+
+try:
+    with open(workspace_file, 'r', encoding='utf-8') as handle:
+        data = json.load(handle)
+except (OSError, json.JSONDecodeError):
+    sys.exit(0)
+
+if not isinstance(data, dict):
+    sys.exit(0)
+
+folders = data.get('folders')
+if not isinstance(folders, list):
+    folders = []
+    data['folders'] = folders
+
+workspace_root = os.path.dirname(workspace_file) or os.curdir
+rel_path = os.path.relpath(worktree_dir, workspace_root)
+rel_path = rel_path.replace(os.path.sep, '/')
+abs_path = os.path.abspath(worktree_dir).replace(os.path.sep, '/')
+
+def normalise(value):
+    return (value or '').replace('\\', '/')
+
+targets = {normalise(rel_path), normalise(abs_path)}
+
+changed = False
+
+if action == 'add':
+    for folder in folders:
+        if isinstance(folder, dict) and normalise(folder.get('path')) in targets:
+            break
+    else:
+        folders.append({'path': rel_path})
+        changed = True
+elif action == 'remove':
+    new_folders = []
+    for folder in folders:
+        if isinstance(folder, dict) and normalise(folder.get('path')) in targets:
+            changed = True
+            continue
+        new_folders.append(folder)
+    if changed:
+        data['folders'] = new_folders
+
+if changed:
+    with open(workspace_file, 'w', encoding='utf-8') as handle:
+        json.dump(data, handle, indent=4)
+        handle.write('\n')
+PY
+}
+
 choose_random_color() {
     local idx=$((RANDOM % ${#DEFAULT_COLORS[@]}))
     echo "${DEFAULT_COLORS[$idx]}"
@@ -252,6 +329,7 @@ cmd_new() {
     fi
 
     create_worktree "$branch" "$base_branch"
+    update_workspace_for_branch add "$branch"
     configure_tmux_session "$branch" "$agent_override" "$agent_override_set"
 }
 
@@ -313,6 +391,7 @@ cmd_remove() {
     fi
     tmux kill-session -t "$session" 2>/dev/null || true
     git worktree remove "$worktree_dir" --force
+    update_workspace_for_branch remove "$branch"
     echo "✓ removed $branch"
 }
 
