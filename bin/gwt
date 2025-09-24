@@ -218,6 +218,33 @@ branch_exists_remote() {
     git ls-remote --exit-code --heads origin "$1" >/dev/null 2>&1
 }
 
+resolve_base_revision() {
+    local base="$1"
+    local commit=""
+
+    if commit=$(git rev-parse --verify --quiet "${base}^{commit}"); then
+        echo "$commit"
+        return
+    fi
+
+    if [[ "$base" != */* ]]; then
+        if commit=$(git rev-parse --verify --quiet "origin/${base}^{commit}"); then
+            echo "$commit"
+            return
+        fi
+
+        if git fetch origin "$base" >/dev/null 2>&1; then
+            if commit=$(git rev-parse --verify --quiet "origin/${base}^{commit}"); then
+                echo "$commit"
+                return
+            fi
+        fi
+    fi
+
+    echo "gwt: unable to resolve base branch '$base'" >&2
+    exit 1
+}
+
 create_worktree() {
     local branch="$1"
     local base_branch="$2"
@@ -228,7 +255,9 @@ create_worktree() {
     if branch_exists_locally "$branch" || branch_exists_remote "$branch"; then
         git worktree add "$worktree_dir" "$branch"
     else
-        git worktree add -b "$branch" "$worktree_dir" "$base_branch"
+        local base_revision
+        base_revision="$(resolve_base_revision "$base_branch")"
+        git worktree add -b "$branch" "$worktree_dir" "$base_revision"
     fi
     copy_env_if_present "$worktree_dir"
 }
@@ -270,7 +299,11 @@ configure_tmux_session() {
     fi
     tmux send-keys -t "$session:0.1" "git status" C-m
 
-    tmux attach-session -t "$session"
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux switch-client -t "$session"
+    else
+        tmux attach-session -t "$session"
+    fi
 }
 
 cmd_new() {

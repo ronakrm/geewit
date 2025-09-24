@@ -39,7 +39,7 @@ Configuration lives in `~/.config/gwt/config`; edit it directly if you prefer.
 Per session, override the agent pane with `gwt new feature-login --agent "my-temp-agent"` or skip launching one entirely via `gwt new feature-login --no-agent`.
 
 ## Daily workflow
-- `gwt new feature-branch [--agent cmd]` – create a worktree, split tmux window, start the configured agent (override per session with `--agent`), and open a git status pane
+- `gwt new feature-branch [base] [--agent cmd]` – create a worktree, split tmux window, start the configured agent (override per session with `--agent`), and open a git status pane; pass a base branch to seed from something other than `main`, even if that branch already has its own gwt worktree
 - `gwt switch feature-branch` – reattach to the tmux session
 - `gwt list` – list worktrees plus matching tmux sessions
 - `gwt remove feature-branch` – remove the worktree and tmux session after the branch is merged
