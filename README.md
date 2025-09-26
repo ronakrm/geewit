@@ -46,6 +46,7 @@ Per session, override the agent pane with `gwt new feature-login --agent "my-tem
 - `gwt status` – get an overview of every worktree’s cleanliness and remote sync state
 - `gwt cleanup` – interactively prune worktrees that are already merged into main
 - `gwt from-pr 123` – spin up a worktree directly from a GitHub PR (requires `gh`)
+- `gwt merge feature-branch [base] [--keep]` – merge a feature branch into the base branch (default `main`) and automatically remove the worktree and local branch unless you pass `--keep`
 
 ## Where worktrees live
 By default `gwt` creates worktrees next to your repository (one directory up from the repo root) using the pattern `<repo-name>-<branch>`. For example, running `gwt new feature-login` inside `~/src/myapp` will create `~/src/myapp-feature-login`.
