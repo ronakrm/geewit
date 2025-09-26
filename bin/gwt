@@ -86,6 +86,17 @@ repo_root() {
     git rev-parse --show-toplevel
 }
 
+primary_worktree_root() {
+    local common
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    if [[ -z "$common" ]]; then
+        return
+    fi
+    if [[ -d "$common" ]]; then
+        dirname "$common"
+    fi
+}
+
 repo_name() {
     basename "$(repo_root)"
 }
@@ -131,7 +142,22 @@ copy_env_if_present() {
 find_workspace_file() {
     local root
     root="$(repo_root)"
-    find "$root" -maxdepth 1 -type f -name '*.code-workspace' -print -quit
+    local workspace
+    workspace=$(find "$root" -maxdepth 1 -type f -name '*.code-workspace' -print -quit 2>/dev/null || true)
+    if [[ -n "$workspace" ]]; then
+        echo "$workspace"
+        return
+    fi
+
+    local primary
+    primary="$(primary_worktree_root)"
+    if [[ -n "$primary" && "$primary" != "$root" ]]; then
+        workspace=$(find "$primary" -maxdepth 1 -type f -name '*.code-workspace' -print -quit 2>/dev/null || true)
+        if [[ -n "$workspace" ]]; then
+            echo "$workspace"
+            return
+        fi
+    fi
 }
 
 update_workspace_for_branch() {
