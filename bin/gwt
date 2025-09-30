@@ -115,6 +115,34 @@ worktree_path_for_branch() {
     echo "$path"
 }
 
+existing_worktree_path_for_branch() {
+    local branch="$1"
+    local current_path=""
+    while IFS= read -r line; do
+        if [[ "$line" == worktree\ * ]]; then
+            current_path="${line#worktree }"
+        elif [[ "$line" == branch\ * ]]; then
+            local ref="${line#branch }"
+            if [[ "$ref" == "refs/heads/$branch" ]]; then
+                echo "$current_path"
+                return 0
+            fi
+        fi
+    done < <(git worktree list --porcelain 2>/dev/null)
+    return 1
+}
+
+resolve_worktree_dir_for_branch() {
+    local branch="$1"
+    local path
+    path="$(existing_worktree_path_for_branch "$branch" || true)"
+    if [[ -n "$path" ]]; then
+        echo "$path"
+    else
+        worktree_path_for_branch "$branch"
+    fi
+}
+
 session_name_for_branch() {
     printf '%s-%s' "$(repo_name)" "$1"
 }
@@ -238,7 +266,7 @@ configure_tmux_session() {
     local agent_override="${2:-}"
     local agent_override_set="${3:-0}"
     local worktree_dir
-    worktree_dir="$(worktree_path_for_branch "$branch")"
+    worktree_dir="$(resolve_worktree_dir_for_branch "$branch")"
     local session
     session="$(session_name_for_branch "$branch")"
 
@@ -348,8 +376,22 @@ cmd_switch() {
     session="$(session_name_for_branch "$branch")"
     if tmux has-session -t "$session" 2>/dev/null; then
         tmux attach-session -t "$session"
-    else
+        return
+    fi
+
+    local worktree_dir
+    worktree_dir="$(existing_worktree_path_for_branch "$branch" || true)"
+    if [[ -z "$worktree_dir" || ! -d "$worktree_dir" ]]; then
         echo "gwt: no tmux session found for $branch" >&2
+        exit 1
+    fi
+
+    echo "gwt: worktree for $branch found at $worktree_dir but tmux session is missing" >&2
+    read -r -p "Create a new tmux session? [y/N] " reply
+    if [[ "$reply" =~ ^[Yy]$ ]]; then
+        configure_tmux_session "$branch" "" 0
+    else
+        echo "gwt: not creating a new tmux session" >&2
         exit 1
     fi
 }
