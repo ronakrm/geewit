@@ -108,7 +108,16 @@ fi
 
 install -m 755 "$SOURCE_BIN" "$TARGET_BIN"
 
-echo "✓ installed to $TARGET_BIN"
+installed_version=""
+if installed_version="$("$TARGET_BIN" --version 2>/dev/null)"; then
+    if [[ -n "$installed_version" ]]; then
+        echo "✓ installed $installed_version to $TARGET_BIN"
+    else
+        echo "✓ installed to $TARGET_BIN"
+    fi
+else
+    echo "✓ installed to $TARGET_BIN"
+fi
 
 mkdir -p "$CONFIG_DIR"
 touch "$CONFIG_FILE"

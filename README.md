@@ -23,7 +23,10 @@ By default the installer copies `bin/gwt` to `~/.local/bin/gwt` and writes confi
 After installation make sure `~/.local/bin` is on your `PATH`, then run:
 ```bash
 gwt help
+gwt version
 ```
+
+`gwt version` (or `gwt --version`) prints the installed release so you can confirm which build you're running.
 
 The installer automatically appends a completion snippet to your detected shell (`~/.bashrc` or `~/.zshrc`). Override the target shell with `--shell bash|zsh` or skip the change entirely with `--skip-shell-config` and add the snippet yourself later.
 

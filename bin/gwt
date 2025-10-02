@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly GWT_VERSION="0.1.1"
+
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gwt"
 CONFIG_FILE="${GWT_CONFIG_FILE:-$CONFIG_DIR/config}"
 
@@ -62,6 +64,7 @@ Agent configuration
 Other
   config-path             Print the config file location
   completion <shell>      Print shell completion script (bash|zsh)
+  version                 Show CLI version
   help                    Show this message
 EOS
 }
@@ -804,7 +807,7 @@ _gwt_completion() {
     local cmd="${COMP_WORDS[1]}"
 
     if (( COMP_CWORD == 1 )); then
-        COMPREPLY=( $(compgen -W "new switch list remove cleanup merge status push from-pr tmux-status agent config-path completion help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "new switch list remove cleanup merge status push from-pr tmux-status agent config-path completion version help" -- "$cur") )
         return
     fi
 
@@ -909,6 +912,7 @@ _gwt() {
         'agent:Manage agent command'
         'config-path:Show config file path'
         'completion:Print completion script'
+        'version:Show CLI version'
         'help:Show usage'
     )
 
@@ -1053,6 +1057,10 @@ cmd_config_path() {
     echo "$CONFIG_FILE"
 }
 
+cmd_version() {
+    echo "gwt $GWT_VERSION"
+}
+
 main() {
     load_config
     ensure_config_dir
@@ -1080,6 +1088,7 @@ main() {
             ;;
         completion) cmd_completion "$@" ;;
         config-path) cmd_config_path ;;
+        version|--version|-v|-V) cmd_version ;;
         help|-h|--help) print_usage ;;
         *) echo "Unknown command: $cmd" >&2; print_usage; exit 1 ;;
     esac
