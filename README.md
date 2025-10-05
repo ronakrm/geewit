@@ -39,13 +39,24 @@ Configuration lives in `~/.config/gwt/config`; edit it directly if you prefer.
 Per session, override the agent pane with `gwt new feature-login --agent "my-temp-agent"` or skip launching one entirely via `gwt new feature-login --no-agent`.
 
 ## Daily workflow
-- `gwt new feature-branch [--agent cmd]` – create a worktree, split tmux window, start the configured agent (override per session with `--agent`), and open a git status pane
+- `gwt new feature-branch [base] [--agent cmd]` – create a worktree, split tmux window, start the configured agent (override per session with `--agent`), and open a git status pane; pass a base branch to seed from something other than `main`, even if that branch already has its own gwt worktree
 - `gwt switch feature-branch` – reattach to the tmux session
 - `gwt list` – list worktrees plus matching tmux sessions
 - `gwt remove feature-branch` – remove the worktree and tmux session after the branch is merged
 - `gwt status` – get an overview of every worktree’s cleanliness and remote sync state
 - `gwt cleanup` – interactively prune worktrees that are already merged into main
 - `gwt from-pr 123` – spin up a worktree directly from a GitHub PR (requires `gh`)
+- `gwt merge feature-branch [base] [--keep]` – merge a feature branch into the base branch (default `main`) and automatically remove the worktree and local branch unless you pass `--keep`
+
+### Merging branches with cleanup
+`gwt merge feature-branch [base]` orchestrates a fast-forward-preventing merge inside the primary worktree (usually the clone you installed from). Both the target branch and the base must be clean; the command will abort with a helpful message if either contains uncommitted changes.
+
+After a successful merge it:
+- Switches back to the base branch so you can continue working in the primary clone.
+- Removes the feature worktree, tmux session, and VS Code workspace folder entry.
+- Deletes the local git branch. Use `--keep` to skip the cleanup if you want to retain any of those.
+
+Conflicts are surfaced in the primary worktree; resolve them there, commit, and rerun `gwt merge` to finish cleanup.
 
 ## Where worktrees live
 By default `gwt` creates worktrees next to your repository (one directory up from the repo root) using the pattern `<repo-name>-<branch>`. For example, running `gwt new feature-login` inside `~/src/myapp` will create `~/src/myapp-feature-login`.
@@ -80,3 +91,4 @@ If you use `share/gwt-profile.sh` it will register the appropriate completion au
 
 ## Tips
 - Alias frequently used agent arguments (for continuing conversations, granting permissions, etc.) so you can pass them to `gwt` without retyping the full command each time (e.g., `alias ccdsp="claude --dangerously-skip-permissions"`).
+- You can invoke `gwt` from any of its worktrees (not just the original clone); the CLI automatically targets the primary repository for shared assets such as tmux sessions and VS Code workspace updates.

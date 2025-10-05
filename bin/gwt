@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gwt"
 CONFIG_FILE="${GWT_CONFIG_FILE:-$CONFIG_DIR/config}"
 
@@ -48,6 +46,7 @@ Core commands
   list                    List worktrees and matching tmux sessions
   remove <branch>         Remove worktree and tmux session
   cleanup [base]          Remove worktrees already merged into base (default: main)
+  merge <branch> [base]   Merge branch into base and clean up the worktree
   status                  Show git status for every worktree
   push [remote]           Push current branch (default remote: origin)
   from-pr <number>        Create a worktree from a GitHub PR (requires gh)
@@ -86,8 +85,29 @@ repo_root() {
     git rev-parse --show-toplevel
 }
 
+primary_worktree_root() {
+    local common
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    if [[ -z "$common" ]]; then
+        return
+    fi
+    if [[ -d "$common" ]]; then
+        dirname "$common"
+    fi
+}
+
+canonical_repo_root() {
+    local primary
+    primary="$(primary_worktree_root)"
+    if [[ -n "$primary" ]]; then
+        echo "$primary"
+    else
+        repo_root
+    fi
+}
+
 repo_name() {
-    basename "$(repo_root)"
+    basename "$(canonical_repo_root)"
 }
 
 resolve_worktree_base() {
@@ -107,12 +127,73 @@ resolve_worktree_base() {
 worktree_path_for_branch() {
     local branch="$1"
     local root
-    root="$(repo_root)"
+    root="$(canonical_repo_root)"
     local base
     base="$(resolve_worktree_base "$root")"
     local prefix="${GWT_PREFIX:-}"
-    local path="$base/${prefix}$(repo_name)-$branch"
+    local path
+    path="$base/${prefix}$(repo_name)-$branch"
     echo "$path"
+}
+
+worktree_dir_for_branch() {
+    local branch="$1"
+    local current=""
+    local path=""
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*)
+                current="${line#worktree }"
+                ;;
+            "branch refs/heads/$branch")
+                if [[ -n "$current" ]]; then
+                    path="$current"
+                    break
+                fi
+                ;;
+        esac
+    done < <(git worktree list --porcelain)
+    if [[ -n "$path" ]]; then
+        echo "$path"
+        return
+    fi
+    local fallback
+    fallback="$(worktree_path_for_branch "$branch")"
+    if [[ -n "$fallback" && -d "$fallback" ]]; then
+        echo "$fallback"
+    fi
+}
+
+ensure_worktree_clean() {
+    local dir="$1"
+    local label="${2:-$dir}"
+    if [[ -z "$dir" || ! -d "$dir" ]]; then
+        return
+    fi
+    local status
+    status="$(git -C "$dir" status --porcelain 2>/dev/null || true)"
+    if [[ -n "$status" ]]; then
+        echo "gwt: worktree '$label' has uncommitted changes" >&2
+        exit 1
+    fi
+}
+
+remove_branch_resources() {
+    local branch="$1"
+    local repo_dir
+    repo_dir="$(canonical_repo_root)"
+    local worktree_dir
+    worktree_dir="$(worktree_dir_for_branch "$branch")"
+    local session
+    session="$(session_name_for_branch "$branch")"
+
+    if [[ -n "$worktree_dir" && -d "$worktree_dir" && "$worktree_dir" != "$repo_dir" ]]; then
+        git -C "$repo_dir" worktree remove "$worktree_dir" --force >/dev/null 2>&1 || true
+    fi
+    if command -v tmux >/dev/null 2>&1; then
+        tmux kill-session -t "$session" 2>/dev/null || true
+    fi
+    update_workspace_for_branch remove "$branch"
 }
 
 session_name_for_branch() {
@@ -121,7 +202,7 @@ session_name_for_branch() {
 
 copy_env_if_present() {
     local root
-    root="$(repo_root)"
+    root="$(canonical_repo_root)"
     local worktree_dir="$1"
     if [[ -f "$root/.env" ]]; then
         cp "$root/.env" "$worktree_dir/.env"
@@ -130,8 +211,8 @@ copy_env_if_present() {
 
 find_workspace_file() {
     local root
-    root="$(repo_root)"
-    find "$root" -maxdepth 1 -type f -name '*.code-workspace' -print -quit
+    root="$(canonical_repo_root)"
+    find "$root" -maxdepth 1 -type f -name '*.code-workspace' -print -quit 2>/dev/null || true
 }
 
 update_workspace_for_branch() {
@@ -218,6 +299,33 @@ branch_exists_remote() {
     git ls-remote --exit-code --heads origin "$1" >/dev/null 2>&1
 }
 
+resolve_base_revision() {
+    local base="$1"
+    local commit=""
+
+    if commit=$(git rev-parse --verify --quiet "${base}^{commit}"); then
+        echo "$commit"
+        return
+    fi
+
+    if [[ "$base" != */* ]]; then
+        if commit=$(git rev-parse --verify --quiet "origin/${base}^{commit}"); then
+            echo "$commit"
+            return
+        fi
+
+        if git fetch origin "$base" >/dev/null 2>&1; then
+            if commit=$(git rev-parse --verify --quiet "origin/${base}^{commit}"); then
+                echo "$commit"
+                return
+            fi
+        fi
+    fi
+
+    echo "gwt: unable to resolve base branch '$base'" >&2
+    exit 1
+}
+
 create_worktree() {
     local branch="$1"
     local base_branch="$2"
@@ -228,7 +336,9 @@ create_worktree() {
     if branch_exists_locally "$branch" || branch_exists_remote "$branch"; then
         git worktree add "$worktree_dir" "$branch"
     else
-        git worktree add -b "$branch" "$worktree_dir" "$base_branch"
+        local base_revision
+        base_revision="$(resolve_base_revision "$base_branch")"
+        git worktree add -b "$branch" "$worktree_dir" "$base_revision"
     fi
     copy_env_if_present "$worktree_dir"
 }
@@ -270,7 +380,11 @@ configure_tmux_session() {
     fi
     tmux send-keys -t "$session:0.1" "git status" C-m
 
-    tmux attach-session -t "$session"
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux switch-client -t "$session"
+    else
+        tmux attach-session -t "$session"
+    fi
 }
 
 cmd_new() {
@@ -420,6 +534,109 @@ cmd_cleanup() {
     done
 }
 
+cmd_merge() {
+    require_git_repo
+    local keep_resources=0
+    local positionals=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --keep)
+                keep_resources=1
+                shift
+                ;;
+            --)
+                shift
+                while [[ $# -gt 0 ]]; do
+                    positionals+=("$1")
+                    shift
+                done
+                break
+                ;;
+            --*)
+                echo "gwt merge: unknown option '$1'" >&2
+                exit 1
+                ;;
+            *)
+                positionals+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    local branch=""
+    local base=""
+    if (( ${#positionals[@]} >= 1 )); then
+        branch="${positionals[0]}"
+    fi
+    if (( ${#positionals[@]} >= 2 )); then
+        base="${positionals[1]}"
+    fi
+
+    if [[ -z "$branch" ]]; then
+        branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    fi
+    if [[ -z "$branch" ]]; then
+        echo "gwt merge: unable to determine branch to merge" >&2
+        exit 1
+    fi
+    if [[ -z "$base" ]]; then
+        base="${GWT_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}"
+    fi
+    if [[ "$branch" == "$base" ]]; then
+        echo "gwt merge: branch and base are identical ($branch)" >&2
+        exit 1
+    fi
+
+    if ! git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+        echo "gwt merge: unknown branch '$branch'" >&2
+        exit 1
+    fi
+
+    local repo_dir
+    repo_dir="$(canonical_repo_root)"
+
+    if ! git rev-parse --verify --quiet "refs/heads/$base" >/dev/null; then
+        local base_commit=""
+        base_commit="$(resolve_base_revision "$base")"
+        git -C "$repo_dir" branch --track "$base" "$base_commit" >/dev/null 2>&1 || \
+            git -C "$repo_dir" branch "$base" "$base_commit" >/dev/null 2>&1 || true
+    fi
+
+    ensure_worktree_clean "$repo_dir" "$base"
+
+    local branch_dir
+    branch_dir="$(worktree_dir_for_branch "$branch")"
+    ensure_worktree_clean "$branch_dir" "$branch"
+
+    git -C "$repo_dir" fetch origin "$base" >/dev/null 2>&1 || true
+
+    if ! git -C "$repo_dir" switch "$base" >/dev/null 2>&1; then
+        git -C "$repo_dir" checkout "$base" >/dev/null 2>&1 || true
+    fi
+
+    echo "→ merging $branch into $base"
+    if ! git -C "$repo_dir" merge --no-ff "$branch"; then
+        echo "⚠ merge conflict detected while merging $branch into $base" >&2
+        echo "   Resolve conflicts in $repo_dir, commit, then rerun 'gwt merge $branch $base'." >&2
+        echo "   Tip: use 'gwt switch $branch' to jump back into the branch worktree." >&2
+        return 1
+    fi
+
+    echo "✓ merged $branch into $base"
+
+    if (( keep_resources )); then
+        return 0
+    fi
+
+    remove_branch_resources "$branch"
+    if git -C "$repo_dir" branch -d "$branch"; then
+        echo "✓ deleted branch $branch"
+    else
+        echo "⚠ could not delete branch $branch (is it still checked out?)" >&2
+    fi
+}
+
 cmd_status() {
     require_git_repo
     local current
@@ -437,11 +654,11 @@ cmd_status() {
                 echo "  ✓ clean"
             fi
             local upstream
-            upstream=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)
+            upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
             if [[ -n "$upstream" ]]; then
                 local ahead behind
-                ahead=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo 0)
-                behind=$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)
+                ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+                behind=$(git rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
                 if (( ahead > 0 || behind > 0 )); then
                     echo "  ↕ ahead:$ahead behind:$behind ($upstream)"
                 fi
@@ -511,17 +728,17 @@ format_sync_status() {
         fi
     fi
     local upstream
-    upstream=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)
+    upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
     if [[ -n "$upstream" ]]; then
         local local_sha remote_sha
         local_sha=$(git rev-parse HEAD 2>/dev/null || echo 0)
-        remote_sha=$(git rev-parse @{u} 2>/dev/null || echo 0)
+        remote_sha=$(git rev-parse '@{u}' 2>/dev/null || echo 0)
         if [[ "$local_sha" == "$remote_sha" ]]; then
             output+=" ✓"
         else
             local ahead_remote behind_remote
-            ahead_remote=$(git rev-list --count @{u}..HEAD 2>/dev/null || echo 0)
-            behind_remote=$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)
+            ahead_remote=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+            behind_remote=$(git rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
             if (( ahead_remote > 0 && behind_remote > 0 )); then
                 output+=" ⟷${ahead_remote}/${behind_remote}"
             elif (( ahead_remote > 0 )); then
@@ -587,7 +804,7 @@ _gwt_completion() {
     local cmd="${COMP_WORDS[1]}"
 
     if (( COMP_CWORD == 1 )); then
-        COMPREPLY=( $(compgen -W "new switch list remove cleanup status push from-pr tmux-status agent config-path completion help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "new switch list remove cleanup merge status push from-pr tmux-status agent config-path completion help" -- "$cur") )
         return
     fi
 
@@ -603,6 +820,32 @@ _gwt_completion() {
             local options
             options=$(printf '%s\n' main master develop $(_gwt_branch_locals) | sort -u)
             COMPREPLY=( $(compgen -W "$options" -- "$cur") )
+            ;;
+        merge)
+            local prev="${COMP_WORDS[COMP_CWORD-1]}"
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--keep" -- "$cur") )
+                return
+            fi
+            if [[ "$prev" == "--keep" ]]; then
+                local branches
+                branches=$(_gwt_branch_locals)
+                if [[ -n "$branches" ]]; then
+                    COMPREPLY=( $(compgen -W "$branches" -- "$cur") )
+                fi
+                return
+            fi
+            if (( COMP_CWORD == 2 )); then
+                local branches
+                branches=$(_gwt_branch_locals)
+                if [[ -n "$branches" ]]; then
+                    COMPREPLY=( $(compgen -W "$branches" -- "$cur") )
+                fi
+            elif (( COMP_CWORD == 3 )); then
+                local bases
+                bases=$(printf '%s\n' main master develop $(_gwt_branch_locals) | sort -u)
+                COMPREPLY=( $(compgen -W "$bases" -- "$cur") )
+            fi
             ;;
         new)
             local prev="${COMP_WORDS[COMP_CWORD-1]}"
@@ -658,6 +901,7 @@ _gwt() {
         'list:List worktrees and sessions'
         'remove:Remove a worktree and session'
         'cleanup:Prune merged worktrees'
+        'merge:Merge branch into base and clean up'
         'status:Show summary of worktrees'
         'push:Push the current branch'
         'from-pr:Create worktree from PR'
@@ -684,6 +928,33 @@ _gwt() {
             local -a bases
             bases=(${(f)"$(printf '%s\n' main master develop $(_gwt_branch_locals) | sort -u)"})
             _describe 'branch' bases
+            ;;
+        merge)
+            local current_arg=${words[CURRENT]}
+            local prev_arg=${words[CURRENT-1]}
+            if [[ $current_arg == -* ]]; then
+                local -a merge_opts
+                merge_opts=(
+                    '--keep:Skip branch and worktree cleanup'
+                )
+                _describe 'option' merge_opts
+                return
+            fi
+            if [[ $prev_arg == --keep ]]; then
+                local -a branches
+                branches=(${(f)"$(_gwt_branch_locals)"})
+                _describe 'branch' branches
+                return
+            fi
+            if (( CURRENT == 3 )); then
+                local -a branches
+                branches=(${(f)"$(_gwt_branch_locals)"})
+                _describe 'branch' branches
+            elif (( CURRENT == 4 )); then
+                local -a bases
+                bases=(${(f)"$(printf '%s\n' main master develop $(_gwt_branch_locals) | sort -u)"})
+                _describe 'branch' bases
+            fi
             ;;
         new)
             local current_arg=${words[CURRENT]}
@@ -793,6 +1064,7 @@ main() {
         list) cmd_list "$@" ;;
         remove) cmd_remove "$@" ;;
         cleanup) cmd_cleanup "$@" ;;
+        merge) cmd_merge "$@" ;;
         status) cmd_status "$@" ;;
         push) cmd_push "$@" ;;
         from-pr) cmd_from_pr "$@" ;;

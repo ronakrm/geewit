@@ -5,7 +5,7 @@
 # reset legacy aliases from the old gwt scripts and wire them to the new CLI.
 
 # Remove legacy aliases/functions that may shadow the new CLI.
-for name in gwt gws gwl gwr gwc gwp gwst gwpr gwm gwd gwt-new gwt-switch gwt-list gwt-remove gwt-cleanup-merged gwt-push gwt-status gwt-from-pr; do
+for name in gwt gws gwl gwr gwc gwp gwst gwpr gwm gwd gwt-new gwt-switch gwt-list gwt-remove gwt-cleanup-merged gwt-merge gwt-push gwt-status gwt-from-pr; do
     unalias "$name" 2>/dev/null || true
     unset -f "$name" 2>/dev/null || true
 done
@@ -13,10 +13,17 @@ done
 _gwt_cli="${GWT_CLI:-$(command -v gwt 2>/dev/null)}"
 if [[ -z "$_gwt_cli" ]]; then
     echo "gwt-profile: cannot find the gwt binary on PATH" >&2
-    return 1 2>/dev/null || exit 1
+    if [[ -n "${ZSH_VERSION:-}" ]]; then
+        return 1
+    fi
+    if [[ "${BASH_SOURCE[0]-}" != "${0-}" ]]; then
+        return 1
+    fi
+    exit 1
 fi
 
 # Helper to invoke the CLI, bypassing shell functions/aliases.
+# shellcheck disable=SC2317
 _gwt_cmd() {
     command "$_gwt_cli" "$@"
 }
@@ -43,6 +50,8 @@ gwt-list() { _gwt_cmd list "$@"; }
 gwt-remove() { _gwt_cmd remove "$@"; }
 
 gwt-cleanup-merged() { _gwt_cmd cleanup "$@"; }
+
+gwt-merge() { _gwt_cmd merge "$@"; }
 
 gwt-push() { _gwt_cmd push "$@"; }
 
