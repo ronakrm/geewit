@@ -58,6 +58,7 @@ Tmux integration
 
 Agent configuration
   agent show              Show current agent command
+  agent status            Show agent pane status for each worktree
   agent set <command>     Update the command used to start the agent pane
   agent clear             Remove the agent command
 
@@ -369,6 +370,7 @@ configure_tmux_session() {
 
     tmux rename-window -t "$session:0" "workspace"
     tmux split-window -t "$session:0" -h -c "$worktree_dir"
+    tmux set-option -t "$session:0" remain-on-exit on
 
     local agent_command=""
     if [[ "$agent_override_set" -eq 1 ]]; then
@@ -377,9 +379,19 @@ configure_tmux_session() {
         agent_command="${GWT_AGENT_COMMAND:-}"
     fi
 
+    tmux set-option -t "$session" @gwt_agent_branch "$branch"
+    tmux set-option -t "$session" @gwt_agent_worktree "$worktree_dir"
+    tmux set-option -t "$session" @gwt_agent_command "$agent_command"
+    tmux set-option -t "$session" @gwt_agent_exit_code ""
+
     if [[ -n "$agent_command" ]]; then
-        tmux send-keys -t "$session:0.0" "$agent_command" C-m
+        tmux set-option -t "$session" @gwt_agent_status "waiting"
+        local escaped_session
+        escaped_session=$(printf '%q' "$session")
+        tmux send-keys -t "$session:0.0" "gwt __agent-run $escaped_session" C-m
         tmux select-pane -t "$session:0.0"
+    else
+        tmux set-option -t "$session" @gwt_agent_status "disabled"
     fi
     tmux send-keys -t "$session:0.1" "git status" C-m
 
@@ -869,7 +881,7 @@ _gwt_completion() {
             ;;
         agent)
             if (( COMP_CWORD == 2 )); then
-                COMPREPLY=( $(compgen -W "show set clear" -- "$cur") )
+                COMPREPLY=( $(compgen -W "show status set clear" -- "$cur") )
             fi
             ;;
         completion)
@@ -986,6 +998,7 @@ _gwt() {
                 local -a actions
                 actions=(
                     'show:Print the configured agent command'
+                    'status:Show agent pane status'
                     'set:Set the agent command'
                     'clear:Remove the agent command'
                 )
@@ -1030,6 +1043,153 @@ cmd_completion() {
             exit 1
             ;;
     esac
+}
+
+infer_agent_status() {
+    local session="$1"
+    local agent_command="$2"
+    local pane="${session}:0.0"
+    local dead=""
+    dead="$(tmux display-message -p -t "$pane" "#{pane_dead}" 2>/dev/null || true)"
+    dead="${dead//$'\n'/}"
+    local current_command=""
+    current_command="$(tmux display-message -p -t "$pane" "#{pane_current_command}" 2>/dev/null || true)"
+    current_command="${current_command//$'\n'/}"
+    local expect_agent=0
+    if [[ -n "${agent_command// }" ]]; then
+        expect_agent=1
+    fi
+    if [[ "$dead" == "1" ]]; then
+        echo "done"
+        return
+    fi
+    if [[ -z "$current_command" ]]; then
+        if (( expect_agent )); then
+            echo "waiting"
+        else
+            echo "unknown"
+        fi
+        return
+    fi
+    case "$current_command" in
+        ""|bash|-bash|zsh|-zsh|sh|-sh|fish|dash)
+            if (( expect_agent )); then
+                echo "waiting"
+            else
+                echo "disabled"
+            fi
+            ;;
+        *)
+            echo "running"
+            ;;
+    esac
+}
+
+cmd_agent_status() {
+    require_git_repo
+    require_command tmux
+    local -a branches=()
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*)
+                ;;
+            "branch "*)
+                local branch="${line#branch }"
+                branch="${branch#refs/heads/}"
+                if [[ -n "$branch" ]]; then
+                    branches+=("$branch")
+                fi
+                ;;
+        esac
+    done < <(git worktree list --porcelain)
+
+    if [[ ${#branches[@]} -eq 0 ]]; then
+        echo "gwt: no worktrees found" >&2
+        exit 1
+    fi
+
+    printf '%-25s %-16s %-20s %s\n' "Branch" "Status" "Session" "Agent"
+    printf '%-25s %-16s %-20s %s\n' "------" "------" "-------" "-----"
+
+    local idx
+    for idx in "${!branches[@]}"; do
+        local branch="${branches[$idx]}"
+        local session
+        session="$(session_name_for_branch "$branch")"
+        local status="missing"
+        local agent_command=""
+        local exit_code=""
+        if tmux has-session -t "$session" 2>/dev/null; then
+            local raw_command=""
+            raw_command="$(tmux show-option -t "$session" -v @gwt_agent_command 2>/dev/null || true)"
+            agent_command="${raw_command//$'\n'/ }"
+            status="$(tmux show-option -t "$session" -v @gwt_agent_status 2>/dev/null || true)"
+            status="${status//$'\n'/}"
+            exit_code="$(tmux show-option -t "$session" -v @gwt_agent_exit_code 2>/dev/null || true)"
+            exit_code="${exit_code//$'\n'/}"
+            local inferred_status
+            inferred_status="$(infer_agent_status "$session" "$agent_command")"
+            if [[ -z "$status" || "$status" == "disabled" ]]; then
+                status="$inferred_status"
+            fi
+            if [[ "$status" == "error" && -n "$exit_code" ]]; then
+                status+=" (exit ${exit_code})"
+            fi
+            if [[ -z "$status" ]]; then
+                status="unknown"
+            fi
+        fi
+        local agent_display="$agent_command"
+        if [[ -z "${agent_display// }" ]]; then
+            if tmux has-session -t "$session" 2>/dev/null; then
+                local pane_command=""
+                pane_command="$(tmux display-message -p -t "${session}:0.0" "#{pane_current_command}" 2>/dev/null || true)"
+                pane_command="${pane_command//$'\n'/}"
+                case "$pane_command" in
+                    ""|bash|-bash|zsh|-zsh|sh|-sh|fish|dash)
+                        ;;
+                    *)
+                        agent_display="$pane_command"
+                        ;;
+                esac
+            fi
+        fi
+        if [[ -z "${agent_display// }" ]]; then
+            agent_display="-"
+        fi
+        printf '%-25s %-16s %-20s %s\n' "$branch" "$status" "$session" "$agent_display"
+    done
+}
+
+cmd_agent_run_internal() {
+    local session="${1:-}"
+    if [[ -z "$session" ]]; then
+        echo "Usage: gwt __agent-run <session>" >&2
+        exit 1
+    fi
+    require_command tmux
+    local agent_command=""
+    local raw_command=""
+    raw_command="$(tmux show-option -t "$session" -v @gwt_agent_command 2>/dev/null || true)"
+    agent_command="${raw_command//$'\n'/ }"
+    if [[ -z "${agent_command// }" ]]; then
+        tmux set-option -t "$session" @gwt_agent_status "disabled"
+        tmux set-option -t "$session" @gwt_agent_exit_code ""
+        return 0
+    fi
+    tmux set-option -t "$session" @gwt_agent_status "running"
+    tmux set-option -t "$session" @gwt_agent_exit_code ""
+    set +e
+    eval "$raw_command"
+    local exit_code=$?
+    set -e
+    if [[ $exit_code -eq 0 ]]; then
+        tmux set-option -t "$session" @gwt_agent_status "done"
+    else
+        tmux set-option -t "$session" @gwt_agent_status "error"
+        tmux set-option -t "$session" @gwt_agent_exit_code "$exit_code"
+    fi
+    return "$exit_code"
 }
 
 cmd_agent_show() {
@@ -1081,15 +1241,17 @@ main() {
             local sub="${1:-}"; shift || true
             case "$sub" in
                 show) cmd_agent_show ;;
+                status) cmd_agent_status ;;
                 set) cmd_agent_set "$@" ;;
                 clear) cmd_agent_clear ;;
-                *) echo "Usage: gwt agent {show|set|clear}" >&2; exit 1 ;;
+                *) echo "Usage: gwt agent {show|status|set|clear}" >&2; exit 1 ;;
             esac
             ;;
         completion) cmd_completion "$@" ;;
         config-path) cmd_config_path ;;
         version|--version|-v|-V) cmd_version ;;
         help|-h|--help) print_usage ;;
+        __agent-run) cmd_agent_run_internal "$@" ;;
         *) echo "Unknown command: $cmd" >&2; print_usage; exit 1 ;;
     esac
 }
