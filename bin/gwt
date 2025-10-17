@@ -383,6 +383,7 @@ configure_tmux_session() {
     tmux set-option -t "$session" @gwt_agent_worktree "$worktree_dir"
     tmux set-option -t "$session" @gwt_agent_command "$agent_command"
     tmux set-option -t "$session" @gwt_agent_exit_code ""
+    tmux set-option -t "$session" @gwt_agent_pid ""
 
     if [[ -n "$agent_command" ]]; then
         tmux set-option -t "$session" @gwt_agent_status "waiting"
@@ -1048,6 +1049,7 @@ cmd_completion() {
 infer_agent_status() {
     local session="$1"
     local agent_command="$2"
+    local agent_pid="$3"
     local pane="${session}:0.0"
     local dead=""
     dead="$(tmux display-message -p -t "$pane" "#{pane_dead}" 2>/dev/null || true)"
@@ -1058,6 +1060,24 @@ infer_agent_status() {
     local expect_agent=0
     if [[ -n "${agent_command// }" ]]; then
         expect_agent=1
+    fi
+    if [[ -n "${agent_pid// }" ]]; then
+        local stat
+        stat="$(ps -o stat= -p "$agent_pid" 2>/dev/null | awk 'NR==1 {gsub(/^[ \t]+|[ \t]+$/, ""); print}')"
+        if [[ -z "$stat" || "$stat" == *Z* ]]; then
+            echo "done"
+            return
+        fi
+        if [[ "$stat" == *R* || "$stat" == *D* ]]; then
+            echo "running"
+            return
+        fi
+        if [[ "$stat" == *T* ]]; then
+            echo "waiting"
+            return
+        fi
+        echo "waiting"
+        return
     fi
     if [[ "$dead" == "1" ]]; then
         echo "done"
@@ -1119,6 +1139,7 @@ cmd_agent_status() {
         local status="missing"
         local agent_command=""
         local exit_code=""
+        local agent_pid=""
         if tmux has-session -t "$session" 2>/dev/null; then
             local raw_command=""
             raw_command="$(tmux show-option -t "$session" -v @gwt_agent_command 2>/dev/null || true)"
@@ -1127,9 +1148,11 @@ cmd_agent_status() {
             status="${status//$'\n'/}"
             exit_code="$(tmux show-option -t "$session" -v @gwt_agent_exit_code 2>/dev/null || true)"
             exit_code="${exit_code//$'\n'/}"
+            agent_pid="$(tmux show-option -t "$session" -v @gwt_agent_pid 2>/dev/null || true)"
+            agent_pid="${agent_pid//$'\n'/}"
             local inferred_status
-            inferred_status="$(infer_agent_status "$session" "$agent_command")"
-            if [[ -z "$status" || "$status" == "disabled" ]]; then
+            inferred_status="$(infer_agent_status "$session" "$agent_command" "$agent_pid")"
+            if [[ -z "$status" || ( "$status" == "disabled" && -n "${agent_command// }" ) ]]; then
                 status="$inferred_status"
             fi
             if [[ "$status" == "error" && -n "$exit_code" ]]; then
@@ -1141,6 +1164,13 @@ cmd_agent_status() {
         fi
         local agent_display="$agent_command"
         if [[ -z "${agent_display// }" ]]; then
+            if [[ -n "${agent_pid// }" ]]; then
+                local ps_command
+                ps_command="$(ps -o comm= -p "$agent_pid" 2>/dev/null | awk 'NR==1 {print}')"
+                if [[ -n "$ps_command" ]]; then
+                    agent_display="$ps_command"
+                fi
+            fi
             if tmux has-session -t "$session" 2>/dev/null; then
                 local pane_command=""
                 pane_command="$(tmux display-message -p -t "${session}:0.0" "#{pane_current_command}" 2>/dev/null || true)"
@@ -1175,14 +1205,22 @@ cmd_agent_run_internal() {
     if [[ -z "${agent_command// }" ]]; then
         tmux set-option -t "$session" @gwt_agent_status "disabled"
         tmux set-option -t "$session" @gwt_agent_exit_code ""
+        tmux set-option -t "$session" @gwt_agent_pid ""
         return 0
     fi
     tmux set-option -t "$session" @gwt_agent_status "running"
     tmux set-option -t "$session" @gwt_agent_exit_code ""
+    tmux set-option -t "$session" @gwt_agent_pid ""
     set +e
-    eval "$raw_command"
+    eval "$raw_command" &
+    local agent_pid=$!
+    if [[ -n "$agent_pid" ]]; then
+        tmux set-option -t "$session" @gwt_agent_pid "$agent_pid"
+    fi
+    wait "$agent_pid"
     local exit_code=$?
     set -e
+    tmux set-option -t "$session" @gwt_agent_pid ""
     if [[ $exit_code -eq 0 ]]; then
         tmux set-option -t "$session" @gwt_agent_status "done"
     else
