@@ -35,6 +35,7 @@ Use the built-in helper commands:
 ```bash
 gwt agent set "my-other-agent --flag"
 gwt agent show
+gwt agent status
 gwt agent clear
 ```
 Configuration lives in `~/.config/gwt/config`; edit it directly if you prefer.
@@ -50,6 +51,7 @@ Per session, override the agent pane with `gwt new feature-login --agent "my-tem
 - `gwt cleanup` – interactively prune worktrees that are already merged into main
 - `gwt from-pr 123` – spin up a worktree directly from a GitHub PR (requires `gh`)
 - `gwt merge feature-branch [base] [--keep]` – merge a feature branch into the base branch (default `main`) and automatically remove the worktree and local branch unless you pass `--keep`
+- `gwt agent status` – inspect every worktree’s agent pane (running, waiting, done, disabled)
 
 ### Merging branches with cleanup
 `gwt merge feature-branch [base]` orchestrates a fast-forward-preventing merge inside the primary worktree (usually the clone you installed from). Both the target branch and the base must be clean; the command will abort with a helpful message if either contains uncommitted changes.
@@ -70,6 +72,18 @@ Customize the location with either of the following:
 
 ## Tmux status bar
 Every session created by `gwt new` configures the tmux status bar to call `gwt tmux-status`. The right side shows the branch name, staged/modified/untracked counts, and upstream sync arrows so you can see repo state at a glance from any pane.
+
+## Agent status dashboard
+`gwt agent status` lists each worktree alongside the matching tmux session, the configured agent command, and its current state:
+
+- `waiting` – pane created and waiting for the agent wrapper to start the configured command
+- `running` – the agent command is active inside the tmux pane
+- `done` – the agent finished with exit code 0 (the pane remains for inspection)
+- `error (exit N)` – the agent finished with a non-zero exit status
+- `disabled` – no agent command is configured for the session
+- `missing` – the worktree exists but there is no tmux session (run `gwt switch <branch>` to recreate it)
+
+This mirrors the tmux naming convention (`<repo>-<branch>`) so you can quickly match a CLI entry to a live session.
 
 ## Uninstall
 Remove the binary and config:
