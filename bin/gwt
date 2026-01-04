@@ -347,12 +347,9 @@ create_worktree() {
     copy_env_if_present "$worktree_dir"
 }
 
-configure_tmux_session() {
+setup_tmux_session_base() {
     local branch="$1"
-    local agent_override="${2:-}"
-    local agent_override_set="${3:-0}"
-    local worktree_dir
-    worktree_dir="$(worktree_path_for_branch "$branch")"
+    local worktree_dir="$2"
     local session
     session="$(session_name_for_branch "$branch")"
 
@@ -370,7 +367,27 @@ configure_tmux_session() {
 
     tmux rename-window -t "$session:0" "workspace"
     tmux split-window -t "$session:0" -h -c "$worktree_dir"
-    tmux set-option -t "$session:0" remain-on-exit on
+}
+
+attach_tmux_session() {
+    local session="$1"
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux switch-client -t "$session"
+    else
+        tmux attach-session -t "$session"
+    fi
+}
+
+configure_tmux_session() {
+    local branch="$1"
+    local agent_override="${2:-}"
+    local agent_override_set="${3:-0}"
+    local worktree_dir
+    worktree_dir="$(worktree_path_for_branch "$branch")"
+    local session
+    session="$(session_name_for_branch "$branch")"
+
+    setup_tmux_session_base "$branch" "$worktree_dir"
 
     local agent_command=""
     if [[ "$agent_override_set" -eq 1 ]]; then
@@ -396,11 +413,22 @@ configure_tmux_session() {
     fi
     tmux send-keys -t "$session:0.1" "git status" C-m
 
-    if [[ -n "${TMUX:-}" ]]; then
-        tmux switch-client -t "$session"
-    else
-        tmux attach-session -t "$session"
-    fi
+    attach_tmux_session "$session"
+}
+
+configure_tmux_session_recovery() {
+    local branch="$1"
+    local worktree_dir="$2"
+    local session
+    session="$(session_name_for_branch "$branch")"
+
+    setup_tmux_session_base "$branch" "$worktree_dir"
+
+    # Show recovery message instead of starting agent
+    tmux send-keys -t "$session:0.0" "echo '⚠ Recovered session - resume agent manually if desired'" C-m
+    tmux send-keys -t "$session:0.1" "git status" C-m
+
+    attach_tmux_session "$session"
 }
 
 cmd_new() {
@@ -461,6 +489,30 @@ cmd_new() {
         base_branch="${GWT_BASE_BRANCH:-$DEFAULT_BASE_BRANCH}"
     fi
 
+    local session
+    session="$(session_name_for_branch "$branch")"
+    local worktree_dir
+    worktree_dir="$(worktree_dir_for_branch "$branch")"
+
+    # Check if worktree exists but session is missing (orphaned worktree)
+    if [[ -n "$worktree_dir" && -d "$worktree_dir" ]]; then
+        if ! tmux has-session -t "$session" 2>/dev/null; then
+            echo "gwt: worktree already exists at $worktree_dir but tmux session is missing"
+            read -r -p "Create new tmux session for this worktree? [y/N] " reply
+            if [[ "$reply" =~ ^[Yy]$ ]]; then
+                configure_tmux_session_recovery "$branch" "$worktree_dir"
+                return
+            else
+                echo "aborted"
+                exit 1
+            fi
+        else
+            echo "gwt: worktree and session already exist for $branch" >&2
+            echo "Use 'gwt switch $branch' to attach to the existing session" >&2
+            exit 1
+        fi
+    fi
+
     create_worktree "$branch" "$base_branch"
     update_workspace_for_branch add "$branch"
     configure_tmux_session "$branch" "$agent_override" "$agent_override_set"
@@ -477,10 +529,28 @@ cmd_switch() {
     local session
     session="$(session_name_for_branch "$branch")"
     if tmux has-session -t "$session" 2>/dev/null; then
-        tmux attach-session -t "$session"
+        if [[ -n "${TMUX:-}" ]]; then
+            tmux switch-client -t "$session"
+        else
+            tmux attach-session -t "$session"
+        fi
     else
-        echo "gwt: no tmux session found for $branch" >&2
-        exit 1
+        # Check if worktree exists but session is missing (orphaned worktree)
+        local worktree_dir
+        worktree_dir="$(worktree_dir_for_branch "$branch")"
+        if [[ -n "$worktree_dir" && -d "$worktree_dir" ]]; then
+            echo "gwt: worktree exists at $worktree_dir but tmux session is missing"
+            read -r -p "Create new tmux session for this worktree? [y/N] " reply
+            if [[ "$reply" =~ ^[Yy]$ ]]; then
+                configure_tmux_session_recovery "$branch" "$worktree_dir"
+            else
+                echo "aborted"
+                exit 1
+            fi
+        else
+            echo "gwt: no tmux session found for $branch" >&2
+            exit 1
+        fi
     fi
 }
 
