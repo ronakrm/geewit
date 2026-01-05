@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR"
 PREFIX="${PREFIX:-$HOME/.local}"
-AGENT_COMMAND=""
+AGENT_COMMAND="claude --dangerously-skip-permissions"
 WORKTREE_BASE=""
 DIR_PREFIX=""
 FORCE=0
@@ -18,7 +18,7 @@ Usage: ./install.sh [options]
 
 Options
   --prefix DIR          Install path prefix (default: ~/.local)
-  --agent CMD           Command to start in the agent pane (quoted if it has spaces)
+  --agent CMD           Command to start in the agent pane (default: claude --dangerously-skip-permissions)
   --worktree-base PATH  Default location for new worktrees (relative paths are resolved from the repo root)
   --dir-prefix STR      Prefix to add to generated worktree directory names
   --force               Overwrite existing gwt binary without prompting
@@ -127,8 +127,11 @@ write_config() {
     local value="$2"
     local escaped
     escaped=$(printf '%q' "$value")
+    local escaped_sed
+    escaped_sed="${escaped//\\/\\\\}"
+    escaped_sed="${escaped_sed//&/\\&}"
     if grep -q "^${key}=" "$CONFIG_FILE"; then
-        sed -i "s|^${key}=.*$|${key}=${escaped}|" "$CONFIG_FILE"
+        sed -i "s|^${key}=.*$|${key}=${escaped_sed}|" "$CONFIG_FILE"
     else
         printf '%s=%s\n' "$key" "$escaped" >> "$CONFIG_FILE"
     fi

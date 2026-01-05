@@ -13,7 +13,7 @@ Optimal usage expects basic tmux familiarity—know how to detach, switch panes,
 ```bash
 git clone <repo-url>
 cd geewit
-./install.sh --agent "my-agent"
+./install.sh
 ```
 
 By default the installer copies `bin/gwt` to `~/.local/bin/gwt` and writes configuration to `~/.config/gwt/config`. Set alternative locations with `--prefix`, `--worktree-base`, or `--dir-prefix`. Re-run the installer with `--force` to overwrite an existing binary.
@@ -106,6 +106,19 @@ Generate completion scripts from the CLI:
 
 If you use `share/gwt-profile.sh` it will register the appropriate completion automatically.
 
+## Hook scripts
+You can run custom scripts automatically when creating or removing worktrees by placing executable scripts in your repository root:
+
+- `.geewit_new.sh` – runs in the right tmux pane after `gwt new` finishes setup
+- `.geewit_remove.sh` – runs in the worktree directory before `gwt remove` cleans up
+
+Scripts must be executable (`chmod +x .geewit_*.sh`). They're useful for project-specific setup like installing dependencies, starting services, or cleaning up resources.
+
+Example `.geewit_new.sh`:
+```bash
+#!/usr/bin/env bash
+npm install
+```
+
 ## Tips
-- Alias frequently used agent arguments (for continuing conversations, granting permissions, etc.) so you can pass them to `gwt` without retyping the full command each time (e.g., `alias ccdsp="claude --dangerously-skip-permissions"`).
 - You can invoke `gwt` from any of its worktrees (not just the original clone); the CLI automatically targets the primary repository for shared assets such as tmux sessions and VS Code workspace updates.
