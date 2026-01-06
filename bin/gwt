@@ -414,7 +414,7 @@ configure_tmux_session() {
     local hook_script
     hook_script="$(get_hook_script_path "new")"
     if [[ -n "$hook_script" ]]; then
-        tmux send-keys -t "$session:0.1" "$hook_script" C-m
+        tmux send-keys -t "$session:0.1" "source $hook_script" C-m
     fi
 
     attach_tmux_session "$session"
@@ -599,8 +599,15 @@ cmd_remove() {
     local hook_script
     hook_script="$(get_hook_script_path "remove")"
     if [[ -n "$hook_script" && -d "$worktree_dir" ]]; then
-        echo "→ running remove hook"
-        (cd "$worktree_dir" && "$hook_script")
+        if tmux has-session -t "$session" 2>/dev/null; then
+            echo "→ running remove hook in tmux pane"
+            local wait_channel="gwt-remove-$$"
+            tmux send-keys -t "$session:0.1" "source $hook_script; tmux wait-for -S $wait_channel" C-m
+            tmux wait-for "$wait_channel"
+        else
+            echo "→ running remove hook"
+            (cd "$worktree_dir" && "$hook_script")
+        fi
     fi
     tmux kill-session -t "$session" 2>/dev/null || true
     git worktree remove "$worktree_dir" --force
