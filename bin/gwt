@@ -46,7 +46,8 @@ Core commands
                           Use --agent CMD or --no-agent to override the agent pane
   switch <branch>         Attach to an existing session
   list                    List worktrees and matching tmux sessions
-  remove <branch>         Remove worktree and tmux session
+  remove <branch>         Remove worktree, tmux session, and local branch
+                          Use --keep-branch to preserve the local branch
   cleanup [base]          Remove worktrees already merged into base (default: main)
   merge <branch> [base]   Merge branch into base and clean up the worktree
   status                  Show git status for every worktree
@@ -582,15 +583,46 @@ cmd_list() {
 cmd_remove() {
     require_git_repo
     require_command tmux
-    local branch="${1:-}"
+    local branch=""
+    local keep_branch=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --keep-branch)
+                keep_branch=1
+                shift
+                ;;
+            --)
+                shift
+                if [[ $# -gt 0 ]]; then
+                    branch="$1"
+                fi
+                break
+                ;;
+            --*)
+                echo "gwt remove: unknown option '$1'" >&2
+                exit 1
+                ;;
+            *)
+                branch="$1"
+                shift
+                ;;
+        esac
+    done
+
     if [[ -z "$branch" ]]; then
-        echo "Usage: gwt remove <branch>" >&2
+        echo "Usage: gwt remove <branch> [--keep-branch]" >&2
         exit 1
     fi
     local worktree_dir session
     worktree_dir="$(worktree_path_for_branch "$branch")"
     session="$(session_name_for_branch "$branch")"
-    echo "This will remove $worktree_dir and tmux session $session"
+    local repo_dir
+    repo_dir="$(canonical_repo_root)"
+    echo "This will remove $worktree_dir, tmux session $session, and local branch $branch"
+    if (( keep_branch )); then
+        echo "(--keep-branch: local branch will be preserved)"
+    fi
     read -r -p "Continue? [y/N] " reply
     if [[ ! "$reply" =~ ^[Yy]$ ]]; then
         echo "aborted"
@@ -612,7 +644,17 @@ cmd_remove() {
     tmux kill-session -t "$session" 2>/dev/null || true
     git worktree remove "$worktree_dir" --force
     update_workspace_for_branch remove "$branch"
-    echo "✓ removed $branch"
+    if (( keep_branch )); then
+        echo "✓ removed worktree and session for $branch (branch preserved)"
+    else
+        if git -C "$repo_dir" branch -d "$branch" 2>/dev/null; then
+            echo "✓ removed $branch"
+        elif git -C "$repo_dir" branch -D "$branch" 2>/dev/null; then
+            echo "✓ removed $branch (force deleted unmerged branch)"
+        else
+            echo "✓ removed worktree and session (branch $branch not found or could not be deleted)"
+        fi
+    fi
 }
 
 cmd_cleanup() {
@@ -912,7 +954,18 @@ _gwt_completion() {
     fi
 
     case "$cmd" in
-        switch|remove)
+        switch)
+            local branches
+            branches=$(_gwt_branch_worktrees)
+            if [[ -n "$branches" ]]; then
+                COMPREPLY=( $(compgen -W "$branches" -- "$cur") )
+            fi
+            ;;
+        remove)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=( $(compgen -W "--keep-branch" -- "$cur") )
+                return
+            fi
             local branches
             branches=$(_gwt_branch_worktrees)
             if [[ -n "$branches" ]]; then
@@ -1023,7 +1076,21 @@ _gwt() {
 
     local cmd=${words[2]}
     case $cmd in
-        switch|remove)
+        switch)
+            local -a branches
+            branches=(${(f)"$(_gwt_branch_worktrees)"})
+            _describe 'branch' branches
+            ;;
+        remove)
+            local current_arg=${words[CURRENT]}
+            if [[ $current_arg == -* ]]; then
+                local -a remove_opts
+                remove_opts=(
+                    '--keep-branch:Preserve the local git branch'
+                )
+                _describe 'option' remove_opts
+                return
+            fi
             local -a branches
             branches=(${(f)"$(_gwt_branch_worktrees)"})
             _describe 'branch' branches
