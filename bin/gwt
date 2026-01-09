@@ -633,8 +633,12 @@ cmd_remove() {
     if [[ -n "$hook_script" && -d "$worktree_dir" ]]; then
         if tmux has-session -t "$session" 2>/dev/null; then
             echo "→ running remove hook in tmux pane"
+            tmux send-keys -t "$session:0.1" C-c C-c
             local wait_channel="gwt-remove-$$"
-            tmux send-keys -t "$session:0.1" "source $hook_script; tmux wait-for -S $wait_channel" C-m
+            local hook_command
+            printf -v hook_command 'cd "%s" && ( source "%s" ) || true; tmux wait-for -S "%s"' \
+                "$worktree_dir" "$hook_script" "$wait_channel"
+            tmux send-keys -t "$session:0.1" "$hook_command" C-m
             tmux wait-for "$wait_channel"
         else
             echo "→ running remove hook"
