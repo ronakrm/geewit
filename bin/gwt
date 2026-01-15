@@ -44,6 +44,7 @@ Usage: gwt <command> [args]
 Core commands
   new <branch> [base]     Create a worktree + tmux session (base defaults to main)
                           Use --agent CMD or --no-agent to override the agent pane
+                          Use --detach or -d to create without attaching
   switch <branch>         Attach to an existing session
   list                    List worktrees and matching tmux sessions
   remove <branch>         Remove worktree, tmux session, and local branch
@@ -392,6 +393,7 @@ configure_tmux_session() {
     local branch="$1"
     local agent_override="${2:-}"
     local agent_override_set="${3:-0}"
+    local detach="${4:-0}"
     local worktree_dir
     worktree_dir="$(worktree_path_for_branch "$branch")"
     local session
@@ -418,7 +420,11 @@ configure_tmux_session() {
         tmux send-keys -t "$session:0.1" "source $hook_script" C-m
     fi
 
-    attach_tmux_session "$session"
+    if (( detach )); then
+        echo "✓ created session $session (use 'gwt switch $branch' to attach)"
+    else
+        attach_tmux_session "$session"
+    fi
 }
 
 configure_tmux_session_recovery() {
@@ -443,6 +449,7 @@ cmd_new() {
     local base_branch=""
     local agent_override=""
     local agent_override_set=0
+    local detach=0
     local positionals=()
 
     while [[ $# -gt 0 ]]; do
@@ -466,6 +473,10 @@ cmd_new() {
                 agent_override_set=1
                 shift
                 ;;
+            --detach|-d)
+                detach=1
+                shift
+                ;;
             --)
                 shift
                 positionals+=("$@")
@@ -483,7 +494,7 @@ cmd_new() {
     done
 
     if [[ ${#positionals[@]} -lt 1 ]]; then
-        echo "Usage: gwt new <branch> [base] [--agent CMD | --no-agent]" >&2
+        echo "Usage: gwt new <branch> [base] [--agent CMD | --no-agent] [--detach]" >&2
         exit 1
     fi
 
@@ -520,7 +531,7 @@ cmd_new() {
 
     create_worktree "$branch" "$base_branch"
     update_workspace_for_branch add "$branch"
-    configure_tmux_session "$branch" "$agent_override" "$agent_override_set"
+    configure_tmux_session "$branch" "$agent_override" "$agent_override_set" "$detach"
 }
 
 cmd_switch() {
@@ -1010,7 +1021,7 @@ _gwt_completion() {
         new)
             local prev="${COMP_WORDS[COMP_CWORD-1]}"
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--agent --no-agent" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--agent --no-agent --detach -d" -- "$cur") )
                 return
             fi
             if [[ "$prev" == "--agent" ]]; then
@@ -1139,6 +1150,8 @@ _gwt() {
                 new_opts=(
                     '--agent:Set command to run in agent pane'
                     '--no-agent:Do not start an agent pane'
+                    '--detach:Create session without attaching'
+                    '-d:Create session without attaching'
                 )
                 _describe 'option' new_opts
                 return
