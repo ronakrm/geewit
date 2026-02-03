@@ -20,6 +20,121 @@ ensure_config_dir() {
     mkdir -p "$CONFIG_DIR"
 }
 
+# Session tracking infrastructure
+SESSIONS_DIR="$CONFIG_DIR/sessions"
+OUTPUT_DIR="$CONFIG_DIR/output"
+
+ensure_sessions_dir() {
+    mkdir -p "$SESSIONS_DIR"
+}
+
+ensure_output_dir() {
+    mkdir -p "$OUTPUT_DIR"
+}
+
+sessions_file_for_repo() {
+    local repo
+    repo="$(repo_name)"
+    echo "$SESSIONS_DIR/${repo}.json"
+}
+
+get_session_data() {
+    local branch="$1"
+    local sessions_file
+    sessions_file="$(sessions_file_for_repo)"
+    if [[ -f "$sessions_file" ]]; then
+        python3 -c "
+import json
+import sys
+try:
+    with open('$sessions_file', 'r') as f:
+        data = json.load(f)
+    result = data.get('$branch', {})
+    print(json.dumps(result))
+except (json.JSONDecodeError, FileNotFoundError):
+    print('{}')
+"
+    else
+        echo '{}'
+    fi
+}
+
+set_session_data() {
+    local branch="$1"
+    local key="$2"
+    local value="$3"
+    ensure_sessions_dir
+    local sessions_file
+    sessions_file="$(sessions_file_for_repo)"
+    python3 -c "
+import json
+import os
+
+sessions_file = '$sessions_file'
+branch = '$branch'
+key = '$key'
+value = '$value'
+
+# Load existing data
+data = {}
+if os.path.exists(sessions_file):
+    try:
+        with open(sessions_file, 'r') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError):
+        data = {}
+
+# Initialize branch if needed
+if branch not in data:
+    data[branch] = {}
+
+# Set the key
+data[branch][key] = value
+
+# Write back
+with open(sessions_file, 'w') as f:
+    json.dump(data, f, indent=2)
+    f.write('\n')
+"
+}
+
+generate_session_uuid() {
+    local branch="$1"
+    local repo
+    repo="$(repo_name)"
+    # Use uuid5 with DNS namespace + repo + branch for deterministic ID
+    python3 -c "import uuid; print(uuid.uuid5(uuid.NAMESPACE_DNS, '$repo-$branch'))"
+}
+
+remove_session_data() {
+    local branch="$1"
+    local sessions_file
+    sessions_file="$(sessions_file_for_repo)"
+    if [[ ! -f "$sessions_file" ]]; then
+        return
+    fi
+    python3 -c "
+import json
+import os
+
+sessions_file = '$sessions_file'
+branch = '$branch'
+
+data = {}
+try:
+    with open(sessions_file, 'r') as f:
+        data = json.load(f)
+except (json.JSONDecodeError, FileNotFoundError):
+    data = {}
+
+if branch in data:
+    del data[branch]
+    with open(sessions_file, 'w') as f:
+        json.dump(data, f, indent=2)
+        f.write('\n')
+"
+}
+
 set_config_value() {
     local key="$1"
     local value="$2"
@@ -39,12 +154,17 @@ set_config_value() {
 
 print_usage() {
     cat <<'EOS'
-Usage: gwt <command> [args]
+Usage: gwt [--repo-path <path>] <command> [args]
 
 Core commands
   new <branch> [base]     Create a worktree + tmux session (base defaults to main)
-                          Use --agent CMD or --no-agent to override the agent pane
-                          Use --detach or -d to create without attaching
+                          Options:
+                            --agent CMD       Override agent command
+                            --no-agent        Skip agent entirely
+                            --detach, -d      Create without attaching
+                            --headless, -H    Run agent headlessly (no tmux)
+                            --no-user-pane    Single pane with agent only
+                            --no-agent-pane   Single pane with user only
   switch <branch>         Attach to an existing session
   list                    List worktrees and matching tmux sessions
   remove <branch>         Remove worktree, tmux session, and local branch
@@ -54,14 +174,21 @@ Core commands
   status                  Show git status for every worktree
   push [remote]           Push current branch (default remote: origin)
   from-pr <number>        Create a worktree from a GitHub PR (requires gh)
+  info <branch>           Show comprehensive branch status (parseable key=value)
+  sessions                List all tracked Claude sessions
 
 Tmux integration
   tmux-status [path]      Internal helper for the tmux status line
 
-Agent configuration
+Agent commands
   agent show              Show current agent command
   agent set <command>     Update the command used to start the agent pane
   agent clear             Remove the agent command
+  agent send <branch> <msg>    Send message to agent
+  agent output <branch>        View agent output (--raw for raw json)
+  agent attach <branch>        Attach to agent in tmux (resumes conversation)
+  agent status [branch]        Show agent status
+  agent clear-session <branch> Clear session ID for fresh start
 
 Other
   config-path             Print the config file location
@@ -350,12 +477,45 @@ create_worktree() {
     echo "→ creating worktree at $worktree_dir"
     if branch_exists_locally "$branch" || branch_exists_remote "$branch"; then
         git worktree add "$worktree_dir" "$branch"
+        echo "existing"  # Branch already existed
     else
         local base_revision
         base_revision="$(resolve_base_revision "$base_branch")"
         git worktree add -b "$branch" "$worktree_dir" "$base_revision"
+        echo "new"  # Newly created branch
     fi
     copy_env_if_present "$worktree_dir"
+}
+
+push_and_create_pr() {
+    local branch="$1"
+    local worktree_dir="$2"
+
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "⚠ gh CLI not found, skipping push and PR creation" >&2
+        echo "  Install gh to enable automatic PR creation: https://cli.github.com" >&2
+        return 0
+    fi
+
+    echo "→ pushing $branch to origin"
+    if ! git -C "$worktree_dir" push -u origin "$branch" 2>&1; then
+        echo "⚠ failed to push branch to origin" >&2
+        return 1
+    fi
+
+    echo "→ creating draft PR"
+    # Create a draft PR with branch name as title
+    local pr_title
+    # Convert branch name to readable title (replace - and _ with spaces, capitalize)
+    pr_title=$(echo "$branch" | sed 's/[-_]/ /g' | sed 's/\b\(.\)/\u\1/g')
+
+    local pr_url
+    if pr_url=$(gh pr create --draft --title "$pr_title" --body "" --head "$branch" 2>&1); then
+        echo "✓ created draft PR: $pr_url"
+    else
+        # PR might already exist or other error
+        echo "⚠ could not create PR (may already exist): $pr_url" >&2
+    fi
 }
 
 setup_tmux_session_base() {
@@ -389,35 +549,103 @@ attach_tmux_session() {
     fi
 }
 
+# Initialize headless agent tracking (no process started - uses -p --resume per message)
+init_headless_agent() {
+    local branch="$1"
+    local worktree_dir="$2"
+    local session_uuid
+    session_uuid="$(generate_session_uuid "$branch")"
+
+    local repo
+    repo="$(repo_name)"
+    ensure_output_dir
+    local output_file="$OUTPUT_DIR/${repo}-${branch}.log"
+
+    # Save session data (no PID since we use -p --resume per message)
+    set_session_data "$branch" "session_id" "$session_uuid"
+    set_session_data "$branch" "mode" "headless"
+    set_session_data "$branch" "output_file" "$output_file"
+    set_session_data "$branch" "worktree" "$worktree_dir"
+    set_session_data "$branch" "started_at" "$(date -Iseconds)"
+
+    echo "✓ initialized headless agent (session: $session_uuid)"
+    echo "  worktree: $worktree_dir"
+    echo "  send messages: gwt agent send $branch 'your message'"
+}
+
 configure_tmux_session() {
     local branch="$1"
     local agent_override="${2:-}"
     local agent_override_set="${3:-0}"
     local detach="${4:-0}"
+    local no_user_pane="${5:-0}"
+    local no_agent_pane="${6:-0}"
     local worktree_dir
     worktree_dir="$(worktree_path_for_branch "$branch")"
     local session
     session="$(session_name_for_branch "$branch")"
 
-    setup_tmux_session_base "$branch" "$worktree_dir"
+    # Kill existing session
+    tmux kill-session -t "$session" 2>/dev/null || true
+    tmux new-session -d -s "$session" -c "$worktree_dir"
 
-    local agent_command=""
-    if [[ "$agent_override_set" -eq 1 ]]; then
-        agent_command="$agent_override"
-    else
-        agent_command="${GWT_AGENT_COMMAND:-}"
+    # Style setup
+    local color
+    color="$(choose_random_color)"
+    tmux set-option -t "$session" status-style "bg=$color,fg=black"
+    tmux set-option -t "$session" status-interval 2
+    tmux set-option -t "$session" status-left-length 80
+    tmux set-option -t "$session" status-right-length 120
+    tmux set-option -t "$session" status-left "#[fg=black,bold] #S "
+    tmux set-option -t "$session" status-right "#[fg=black,bold]#(GWT_PANE_PATH='#{pane_current_path}' gwt tmux-status) "
+
+    tmux rename-window -t "$session:0" "workspace"
+
+    # Only split if we need both panes
+    if (( !no_user_pane && !no_agent_pane )); then
+        tmux split-window -t "$session:0" -h -c "$worktree_dir"
     fi
+
+    # Determine agent command
+    local agent_command=""
+    if (( !no_agent_pane )); then
+        if [[ "$agent_override_set" -eq 1 ]]; then
+            agent_command="$agent_override"
+        else
+            agent_command="${GWT_AGENT_COMMAND:-}"
+        fi
+    fi
+
+    # Track Claude session
+    local session_uuid
+    session_uuid="$(generate_session_uuid "$branch")"
 
     if [[ -n "$agent_command" ]]; then
+        # Inject session ID into agent command if it's Claude
+        if [[ "$agent_command" == claude* ]]; then
+            agent_command="$agent_command --session-id $session_uuid"
+        fi
         tmux send-keys -t "$session:0.0" "$agent_command" C-m
         tmux select-pane -t "$session:0.0"
+        set_session_data "$branch" "session_id" "$session_uuid"
+        set_session_data "$branch" "mode" "tmux"
+        set_session_data "$branch" "worktree" "$worktree_dir"
+        set_session_data "$branch" "started_at" "$(date -Iseconds)"
     fi
-    tmux send-keys -t "$session:0.1" "git status" C-m
 
-    local hook_script
-    hook_script="$(get_hook_script_path "new")"
-    if [[ -n "$hook_script" ]]; then
-        tmux send-keys -t "$session:0.1" "source $hook_script" C-m
+    # User pane setup
+    if (( !no_user_pane )); then
+        local user_pane="$session:0.1"
+        if (( no_agent_pane )); then
+            user_pane="$session:0.0"
+        fi
+        tmux send-keys -t "$user_pane" "git status" C-m
+
+        local hook_script
+        hook_script="$(get_hook_script_path "new")"
+        if [[ -n "$hook_script" ]]; then
+            tmux send-keys -t "$user_pane" "source $hook_script" C-m
+        fi
     fi
 
     if (( detach )); then
@@ -444,12 +672,14 @@ configure_tmux_session_recovery() {
 
 cmd_new() {
     require_git_repo
-    require_command tmux
     local branch=""
     local base_branch=""
     local agent_override=""
     local agent_override_set=0
     local detach=0
+    local headless=0
+    local no_user_pane=0
+    local no_agent_pane=0
     local positionals=()
 
     while [[ $# -gt 0 ]]; do
@@ -477,6 +707,20 @@ cmd_new() {
                 detach=1
                 shift
                 ;;
+            --headless|-H)
+                headless=1
+                shift
+                ;;
+            --no-user-pane)
+                no_user_pane=1
+                shift
+                ;;
+            --no-agent-pane)
+                no_agent_pane=1
+                agent_override=""
+                agent_override_set=1
+                shift
+                ;;
             --)
                 shift
                 positionals+=("$@")
@@ -494,8 +738,14 @@ cmd_new() {
     done
 
     if [[ ${#positionals[@]} -lt 1 ]]; then
-        echo "Usage: gwt new <branch> [base] [--agent CMD | --no-agent] [--detach]" >&2
+        echo "Usage: gwt new <branch> [base] [options]" >&2
+        echo "Options: --agent CMD, --no-agent, --detach/-d, --headless/-H, --no-user-pane, --no-agent-pane" >&2
         exit 1
+    fi
+
+    # Headless mode doesn't need tmux
+    if (( !headless )); then
+        require_command tmux
     fi
 
     branch="${positionals[0]}"
@@ -512,7 +762,19 @@ cmd_new() {
 
     # Check if worktree exists but session is missing (orphaned worktree)
     if [[ -n "$worktree_dir" && -d "$worktree_dir" ]]; then
-        if ! tmux has-session -t "$session" 2>/dev/null; then
+        if (( headless )); then
+            # For headless mode, check if already tracked
+            local existing_data
+            existing_data="$(get_session_data "$branch")"
+            if [[ -n "$existing_data" && "$existing_data" != "{}" ]]; then
+                echo "gwt: headless agent already exists for $branch" >&2
+                echo "Use 'gwt agent send $branch <message>' to send messages" >&2
+                exit 1
+            fi
+            # Worktree exists but not tracked as headless, set it up
+            init_headless_agent "$branch" "$worktree_dir"
+            return
+        elif ! tmux has-session -t "$session" 2>/dev/null; then
             echo "gwt: worktree already exists at $worktree_dir but tmux session is missing"
             read -r -p "Create new tmux session for this worktree? [y/N] " reply
             if [[ "$reply" =~ ^[Yy]$ ]]; then
@@ -529,9 +791,23 @@ cmd_new() {
         fi
     fi
 
-    create_worktree "$branch" "$base_branch"
+    local branch_status
+    branch_status="$(create_worktree "$branch" "$base_branch")"
     update_workspace_for_branch add "$branch"
-    configure_tmux_session "$branch" "$agent_override" "$agent_override_set" "$detach"
+
+    local new_worktree_dir
+    new_worktree_dir="$(worktree_path_for_branch "$branch")"
+
+    # Push and create PR for newly created branches
+    if [[ "$branch_status" == "new" ]]; then
+        push_and_create_pr "$branch" "$new_worktree_dir"
+    fi
+
+    if (( headless )); then
+        init_headless_agent "$branch" "$new_worktree_dir"
+    else
+        configure_tmux_session "$branch" "$agent_override" "$agent_override_set" "$detach" "$no_user_pane" "$no_agent_pane"
+    fi
 }
 
 cmd_switch() {
@@ -542,6 +818,23 @@ cmd_switch() {
         echo "Usage: gwt switch <branch>" >&2
         exit 1
     fi
+
+    # Check for headless agent first
+    local data
+    data="$(get_session_data "$branch")"
+    local mode
+    mode=$(echo "$data" | python3 -c "import json,sys; print(json.load(sys.stdin).get('mode',''))" 2>/dev/null)
+
+    if [[ "$mode" == "headless" ]]; then
+        echo "gwt: branch $branch has a headless agent"
+        read -r -p "Attach to agent in tmux? [y/N] " reply
+        if [[ "$reply" =~ ^[Yy]$ ]]; then
+            cmd_agent_attach "$branch"
+            return
+        fi
+        # If user declines, fall through to regular handling
+    fi
+
     local session
     session="$(session_name_for_branch "$branch")"
     if tmux has-session -t "$session" 2>/dev/null; then
@@ -659,6 +952,10 @@ cmd_remove() {
     tmux kill-session -t "$session" 2>/dev/null || true
     git worktree remove "$worktree_dir" --force
     update_workspace_for_branch remove "$branch"
+
+    # Clean up session tracking data
+    remove_session_data "$branch"
+
     if (( keep_branch )); then
         echo "✓ removed worktree and session for $branch (branch preserved)"
     else
@@ -964,7 +1261,7 @@ _gwt_completion() {
     local cmd="${COMP_WORDS[1]}"
 
     if (( COMP_CWORD == 1 )); then
-        COMPREPLY=( $(compgen -W "new switch list remove cleanup merge status push from-pr tmux-status agent config-path completion version help" -- "$cur") )
+        COMPREPLY=( $(compgen -W "new switch list remove cleanup merge status push from-pr tmux-status agent info sessions config-path completion version help" -- "$cur") )
         return
     fi
 
@@ -1021,7 +1318,7 @@ _gwt_completion() {
         new)
             local prev="${COMP_WORDS[COMP_CWORD-1]}"
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=( $(compgen -W "--agent --no-agent --detach -d" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--agent --no-agent --detach -d --headless -H --no-user-pane --no-agent-pane" -- "$cur") )
                 return
             fi
             if [[ "$prev" == "--agent" ]]; then
@@ -1035,9 +1332,27 @@ _gwt_completion() {
                 fi
             fi
             ;;
+        info)
+            local branches
+            branches=$(_gwt_branch_worktrees)
+            if [[ -n "$branches" ]]; then
+                COMPREPLY=( $(compgen -W "$branches" -- "$cur") )
+            fi
+            ;;
         agent)
             if (( COMP_CWORD == 2 )); then
-                COMPREPLY=( $(compgen -W "show set clear" -- "$cur") )
+                COMPREPLY=( $(compgen -W "show set clear send output attach status clear-session" -- "$cur") )
+            elif (( COMP_CWORD == 3 )); then
+                local subcmd="${COMP_WORDS[2]}"
+                case "$subcmd" in
+                    send|output|attach|status|clear-session)
+                        local branches
+                        branches=$(_gwt_branch_worktrees)
+                        if [[ -n "$branches" ]]; then
+                            COMPREPLY=( $(compgen -W "$branches" -- "$cur") )
+                        fi
+                        ;;
+                esac
             fi
             ;;
         completion)
@@ -1077,7 +1392,9 @@ _gwt() {
         'push:Push the current branch'
         'from-pr:Create worktree from PR'
         'tmux-status:Internal status helper'
-        'agent:Manage agent command'
+        'agent:Manage agent command and sessions'
+        'info:Show comprehensive branch status'
+        'sessions:List all tracked Claude sessions'
         'config-path:Show config file path'
         'completion:Print completion script'
         'version:Show CLI version'
@@ -1152,6 +1469,10 @@ _gwt() {
                     '--no-agent:Do not start an agent pane'
                     '--detach:Create session without attaching'
                     '-d:Create session without attaching'
+                    '--headless:Run agent headlessly (no tmux)'
+                    '-H:Run agent headlessly (no tmux)'
+                    '--no-user-pane:Single pane with agent only'
+                    '--no-agent-pane:Single pane with user only'
                 )
                 _describe 'option' new_opts
                 return
@@ -1165,6 +1486,11 @@ _gwt() {
                 _describe 'branch' locals
             fi
             ;;
+        info)
+            local -a branches
+            branches=(${(f)"$(_gwt_branch_worktrees)"})
+            _describe 'branch' branches
+            ;;
         agent)
             if (( CURRENT == 3 )); then
                 local -a actions
@@ -1172,8 +1498,22 @@ _gwt() {
                     'show:Print the configured agent command'
                     'set:Set the agent command'
                     'clear:Remove the agent command'
+                    'send:Send message to agent'
+                    'output:View agent output'
+                    'attach:Attach to agent in tmux'
+                    'status:Show agent status'
+                    'clear-session:Clear session ID for fresh start'
                 )
                 _describe 'agent action' actions
+            elif (( CURRENT == 4 )); then
+                local subcmd=${words[3]}
+                case $subcmd in
+                    send|output|attach|status|clear-session)
+                        local -a branches
+                        branches=(${(f)"$(_gwt_branch_worktrees)"})
+                        _describe 'branch' branches
+                        ;;
+                esac
             fi
             ;;
         completion)
@@ -1237,6 +1577,359 @@ cmd_agent_clear() {
     echo "Agent command cleared"
 }
 
+cmd_agent_send() {
+    local branch="${1:-}"
+    shift || true
+    local message="$*"
+
+    if [[ -z "$branch" ]]; then
+        echo "Usage: gwt agent send <branch> <message>" >&2
+        exit 1
+    fi
+    if [[ -z "$message" ]]; then
+        echo "gwt agent send: message required" >&2
+        exit 1
+    fi
+
+    require_git_repo
+    local data
+    data="$(get_session_data "$branch")"
+
+    local mode session_id worktree_dir output_file
+    mode=$(echo "$data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('mode',''))")
+    session_id=$(echo "$data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('session_id',''))")
+    worktree_dir=$(echo "$data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('worktree',''))")
+    output_file=$(echo "$data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('output_file',''))")
+
+    if [[ -z "$session_id" ]]; then
+        echo "gwt: no session found for branch '$branch'" >&2
+        echo "Use 'gwt new $branch --headless' to create a headless agent first" >&2
+        exit 1
+    fi
+
+    if [[ "$mode" == "headless" ]]; then
+        echo "→ sending message to headless agent..."
+        # Use -p --resume for single-shot message
+        (
+            cd "$worktree_dir" || exit 1
+            claude -p --resume "$session_id" \
+                --output-format stream-json \
+                --dangerously-skip-permissions \
+                "$message" >> "$output_file" 2>&1
+        )
+        echo "✓ message sent (output appended to $output_file)"
+    else
+        # Tmux mode - send keys to agent pane
+        local session
+        session="$(session_name_for_branch "$branch")"
+        if ! tmux has-session -t "$session" 2>/dev/null; then
+            echo "gwt: tmux session not found for $branch" >&2
+            exit 1
+        fi
+        tmux send-keys -t "$session:0.0" "$message" C-m
+        echo "✓ message sent to tmux pane"
+    fi
+}
+
+cmd_agent_output() {
+    local branch="${1:-}"
+    local raw=0
+    local lines=50
+
+    if [[ -z "$branch" ]]; then
+        echo "Usage: gwt agent output <branch> [--raw] [-n <lines>]" >&2
+        exit 1
+    fi
+    shift
+
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --raw) raw=1; shift ;;
+            -n)
+                if [[ $# -lt 2 ]]; then
+                    echo "gwt agent output: -n requires a number" >&2
+                    exit 1
+                fi
+                lines="$2"
+                shift 2
+                ;;
+            *) shift ;;
+        esac
+    done
+
+    require_git_repo
+    local data
+    data="$(get_session_data "$branch")"
+    local mode output_file
+    mode=$(echo "$data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('mode',''))")
+    output_file=$(echo "$data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('output_file',''))")
+
+    if [[ "$mode" == "headless" ]]; then
+        if [[ ! -f "$output_file" ]]; then
+            echo "gwt: no output file found for $branch" >&2
+            echo "Send a message first: gwt agent send $branch 'message'" >&2
+            exit 1
+        fi
+        if (( raw )); then
+            tail -n "$lines" "$output_file"
+        else
+            # Parse stream-json and extract assistant content
+            tail -n "$lines" "$output_file" | python3 -c "
+import sys
+import json
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+        if obj.get('type') == 'assistant' and 'content' in obj:
+            for block in obj['content']:
+                if block.get('type') == 'text':
+                    print(block.get('text', ''))
+    except json.JSONDecodeError:
+        pass
+"
+        fi
+    else
+        # Tmux mode - capture pane
+        local session
+        session="$(session_name_for_branch "$branch")"
+        if ! tmux has-session -t "$session" 2>/dev/null; then
+            echo "gwt: tmux session not found for $branch" >&2
+            exit 1
+        fi
+        tmux capture-pane -t "$session:0.0" -p -S -"$lines"
+    fi
+}
+
+cmd_agent_attach() {
+    local branch="${1:-}"
+    if [[ -z "$branch" ]]; then
+        echo "Usage: gwt agent attach <branch>" >&2
+        exit 1
+    fi
+
+    require_git_repo
+    require_command tmux
+
+    local data
+    data="$(get_session_data "$branch")"
+    local session_id mode worktree_dir
+    session_id=$(echo "$data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('session_id',''))")
+    mode=$(echo "$data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('mode',''))")
+    worktree_dir=$(echo "$data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('worktree',''))")
+
+    if [[ -z "$worktree_dir" ]]; then
+        worktree_dir="$(worktree_dir_for_branch "$branch")"
+    fi
+
+    if [[ -z "$worktree_dir" || ! -d "$worktree_dir" ]]; then
+        echo "gwt: worktree not found for $branch" >&2
+        exit 1
+    fi
+
+    local session
+    session="$(session_name_for_branch "$branch")"
+
+    # Kill existing tmux session if any
+    tmux kill-session -t "$session" 2>/dev/null || true
+
+    # Create new tmux session
+    tmux new-session -d -s "$session" -c "$worktree_dir"
+
+    # Style setup
+    local color
+    color="$(choose_random_color)"
+    tmux set-option -t "$session" status-style "bg=$color,fg=black"
+    tmux set-option -t "$session" status-interval 2
+    tmux set-option -t "$session" status-left-length 80
+    tmux set-option -t "$session" status-right-length 120
+    tmux set-option -t "$session" status-left "#[fg=black,bold] #S "
+    tmux set-option -t "$session" status-right "#[fg=black,bold]#(GWT_PANE_PATH='#{pane_current_path}' gwt tmux-status) "
+
+    tmux rename-window -t "$session:0" "workspace"
+    tmux split-window -t "$session:0" -h -c "$worktree_dir"
+
+    # Resume Claude conversation in tmux
+    if [[ -n "$session_id" ]]; then
+        tmux send-keys -t "$session:0.0" "claude --resume $session_id --dangerously-skip-permissions" C-m
+    else
+        # No session ID - start fresh
+        local agent_cmd="${GWT_AGENT_COMMAND:-claude --dangerously-skip-permissions}"
+        local new_session_id
+        new_session_id="$(generate_session_uuid "$branch")"
+        if [[ "$agent_cmd" == claude* ]]; then
+            agent_cmd="$agent_cmd --session-id $new_session_id"
+        fi
+        tmux send-keys -t "$session:0.0" "$agent_cmd" C-m
+        set_session_data "$branch" "session_id" "$new_session_id"
+    fi
+
+    tmux send-keys -t "$session:0.1" "git status" C-m
+
+    # Update mode to tmux
+    set_session_data "$branch" "mode" "tmux"
+    set_session_data "$branch" "worktree" "$worktree_dir"
+
+    attach_tmux_session "$session"
+}
+
+cmd_agent_status() {
+    local branch="${1:-}"
+    require_git_repo
+
+    if [[ -n "$branch" ]]; then
+        # Show status for specific branch
+        local data
+        data="$(get_session_data "$branch")"
+        if [[ -z "$data" || "$data" == "{}" ]]; then
+            echo "No agent session for $branch"
+            return
+        fi
+        echo "Branch: $branch"
+        echo "$data" | python3 -c "
+import json
+import sys
+d = json.load(sys.stdin)
+for key, value in sorted(d.items()):
+    print(f'  {key}: {value}')
+"
+    else
+        # Show all sessions
+        local sessions_file
+        sessions_file="$(sessions_file_for_repo)"
+        if [[ ! -f "$sessions_file" ]]; then
+            echo "No tracked sessions"
+            return
+        fi
+        python3 -c "
+import json
+with open('$sessions_file') as f:
+    data = json.load(f)
+if not data:
+    print('No tracked sessions')
+else:
+    for branch, info in sorted(data.items()):
+        mode = info.get('mode', '?')
+        sid = info.get('session_id', '')[:12]
+        print(f'{branch:25} {mode:10} {sid}...')
+"
+    fi
+}
+
+cmd_agent_clear_session() {
+    local branch="${1:-}"
+    if [[ -z "$branch" ]]; then
+        echo "Usage: gwt agent clear-session <branch>" >&2
+        exit 1
+    fi
+    require_git_repo
+    remove_session_data "$branch"
+    echo "✓ cleared session for $branch (next agent start will be fresh)"
+}
+
+cmd_info() {
+    local branch="${1:-}"
+    require_git_repo
+
+    if [[ -z "$branch" ]]; then
+        branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$branch" ]]; then
+        echo "Usage: gwt info <branch>" >&2
+        exit 1
+    fi
+
+    local worktree_dir session session_data
+    worktree_dir="$(worktree_dir_for_branch "$branch")"
+    session="$(session_name_for_branch "$branch")"
+    session_data="$(get_session_data "$branch")"
+
+    # Output as parseable key=value format (also human readable)
+    echo "branch=$branch"
+    echo "repo=$(repo_name)"
+    echo "tmux_session=$session"
+
+    if [[ -n "$worktree_dir" && -d "$worktree_dir" ]]; then
+        echo "worktree=$worktree_dir"
+        echo "worktree_exists=true"
+
+        # Git status
+        local status_count
+        status_count="$(git -C "$worktree_dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+        echo "uncommitted_changes=$status_count"
+
+        # Upstream status
+        local upstream ahead behind
+        upstream=$(git -C "$worktree_dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+        if [[ -n "$upstream" ]]; then
+            ahead=$(git -C "$worktree_dir" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+            behind=$(git -C "$worktree_dir" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
+            echo "upstream=$upstream"
+            echo "ahead=$ahead"
+            echo "behind=$behind"
+        else
+            echo "upstream="
+        fi
+    else
+        echo "worktree="
+        echo "worktree_exists=false"
+    fi
+
+    # Tmux status
+    if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$session" 2>/dev/null; then
+        echo "tmux_alive=true"
+    else
+        echo "tmux_alive=false"
+    fi
+
+    # Agent session info
+    if [[ -n "$session_data" && "$session_data" != "{}" ]]; then
+        local mode session_id output_file started_at
+        mode=$(echo "$session_data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('mode',''))")
+        session_id=$(echo "$session_data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('session_id',''))")
+        output_file=$(echo "$session_data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('output_file',''))")
+        started_at=$(echo "$session_data" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('started_at',''))")
+
+        echo "agent_mode=$mode"
+        echo "agent_session_id=$session_id"
+        echo "agent_output_file=$output_file"
+        echo "agent_started_at=$started_at"
+    else
+        echo "agent_mode="
+        echo "agent_session_id="
+    fi
+}
+
+cmd_sessions() {
+    require_git_repo
+    local sessions_file
+    sessions_file="$(sessions_file_for_repo)"
+
+    if [[ ! -f "$sessions_file" ]]; then
+        echo "No tracked sessions"
+        return
+    fi
+
+    printf 'Claude Sessions\n---------------\n'
+    python3 -c "
+import json
+with open('$sessions_file') as f:
+    data = json.load(f)
+if not data:
+    print('(none)')
+else:
+    for branch, info in sorted(data.items()):
+        mode = info.get('mode', '?')
+        sid = info.get('session_id', '')[:12]
+        print(f'{branch:25} {mode:10} {sid}...')
+"
+}
+
 cmd_config_path() {
     echo "$CONFIG_FILE"
 }
@@ -1248,6 +1941,38 @@ cmd_version() {
 main() {
     load_config
     ensure_config_dir
+
+    # Parse global options before command dispatch
+    local repo_path=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "gwt: --repo-path requires a path argument" >&2
+                    exit 1
+                fi
+                repo_path="$2"
+                shift 2
+                ;;
+            --repo-path=*)
+                repo_path="${1#*=}"
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    # If repo path specified, cd to it
+    if [[ -n "$repo_path" ]]; then
+        if [[ ! -d "$repo_path" ]]; then
+            echo "gwt: repo path does not exist: $repo_path" >&2
+            exit 1
+        fi
+        cd "$repo_path" || exit 1
+    fi
+
     local cmd="${1:-help}"
     shift || true
     case "$cmd" in
@@ -1267,9 +1992,16 @@ main() {
                 show) cmd_agent_show ;;
                 set) cmd_agent_set "$@" ;;
                 clear) cmd_agent_clear ;;
-                *) echo "Usage: gwt agent {show|set|clear}" >&2; exit 1 ;;
+                send) cmd_agent_send "$@" ;;
+                output) cmd_agent_output "$@" ;;
+                attach) cmd_agent_attach "$@" ;;
+                status) cmd_agent_status "$@" ;;
+                clear-session) cmd_agent_clear_session "$@" ;;
+                *) echo "Usage: gwt agent {show|set|clear|send|output|attach|status|clear-session}" >&2; exit 1 ;;
             esac
             ;;
+        info) cmd_info "$@" ;;
+        sessions) cmd_sessions ;;
         completion) cmd_completion "$@" ;;
         config-path) cmd_config_path ;;
         version|--version|-v|-V) cmd_version ;;
