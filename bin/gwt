@@ -477,45 +477,12 @@ create_worktree() {
     echo "→ creating worktree at $worktree_dir"
     if branch_exists_locally "$branch" || branch_exists_remote "$branch"; then
         git worktree add "$worktree_dir" "$branch"
-        echo "existing"  # Branch already existed
     else
         local base_revision
         base_revision="$(resolve_base_revision "$base_branch")"
         git worktree add -b "$branch" "$worktree_dir" "$base_revision"
-        echo "new"  # Newly created branch
     fi
     copy_env_if_present "$worktree_dir"
-}
-
-push_and_create_pr() {
-    local branch="$1"
-    local worktree_dir="$2"
-
-    if ! command -v gh >/dev/null 2>&1; then
-        echo "⚠ gh CLI not found, skipping push and PR creation" >&2
-        echo "  Install gh to enable automatic PR creation: https://cli.github.com" >&2
-        return 0
-    fi
-
-    echo "→ pushing $branch to origin"
-    if ! git -C "$worktree_dir" push -u origin "$branch" 2>&1; then
-        echo "⚠ failed to push branch to origin" >&2
-        return 1
-    fi
-
-    echo "→ creating draft PR"
-    # Create a draft PR with branch name as title
-    local pr_title
-    # Convert branch name to readable title (replace - and _ with spaces, capitalize)
-    pr_title=$(echo "$branch" | sed 's/[-_]/ /g' | sed 's/\b\(.\)/\u\1/g')
-
-    local pr_url
-    if pr_url=$(gh pr create --draft --title "$pr_title" --body "" --head "$branch" 2>&1); then
-        echo "✓ created draft PR: $pr_url"
-    else
-        # PR might already exist or other error
-        echo "⚠ could not create PR (may already exist): $pr_url" >&2
-    fi
 }
 
 setup_tmux_session_base() {
@@ -791,19 +758,12 @@ cmd_new() {
         fi
     fi
 
-    local branch_status
-    branch_status="$(create_worktree "$branch" "$base_branch")"
+    create_worktree "$branch" "$base_branch"
     update_workspace_for_branch add "$branch"
 
-    local new_worktree_dir
-    new_worktree_dir="$(worktree_path_for_branch "$branch")"
-
-    # Push and create PR for newly created branches
-    if [[ "$branch_status" == "new" ]]; then
-        push_and_create_pr "$branch" "$new_worktree_dir"
-    fi
-
     if (( headless )); then
+        local new_worktree_dir
+        new_worktree_dir="$(worktree_path_for_branch "$branch")"
         init_headless_agent "$branch" "$new_worktree_dir"
     else
         configure_tmux_session "$branch" "$agent_override" "$agent_override_set" "$detach" "$no_user_pane" "$no_agent_pane"
