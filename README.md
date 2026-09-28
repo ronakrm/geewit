@@ -1,4 +1,5 @@
-# geewit
+# geewit (deprecated)
+(DEPRECATED, models and scaffolds automatically do a bunch of this better already)
 
 Git worktree helpers with first-class tmux integration for coding agents.
 
